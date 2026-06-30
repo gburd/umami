@@ -1,0 +1,24 @@
+[package]
+name = "umami-cli"
+description = "Command-line interface for the umami log anomaly-detection library (a reimplementation of unomalycli)."
+readme = "../README.md"
+keywords = ["log", "anomaly", "cli", "unomaly", "observability"]
+categories = ["command-line-utilities"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "umami"
+path = "src/main.rs"
+
+[dependencies]
+umami = { workspace = true }
+clap = { version = "4.5", features = ["derive"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
