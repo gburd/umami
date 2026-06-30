@@ -1,13 +1,12 @@
-//! Pretty-printers that render a token sequence in the various formats
-//! supported by `unomalycli tokenize -pretty=…`.
+//! Pretty-printers that render a token sequence in several formats
+//! (`test`, `colors`, `params`, `delimiters`, `static`).
 //!
-//! All formats are reproduced exactly so that output can be diffed against the
-//! reference implementation.
+//! All formats are stable so that output can be diffed against golden corpora.
 
 use crate::token::{Token, TokenType};
 use std::fmt::Write;
 
-/// The available pretty-printer styles, mirroring `unomalycli`.
+/// The available pretty-printer styles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Pretty {
     /// `T{text}` tokens joined by spaces, where `T` is the numeric type.

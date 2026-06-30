@@ -1,10 +1,9 @@
-//! Golden corpus tests: verify the umami tokenizer reproduces the exact output
-//! of the reference `unomalycli tokenize` command.
+//! Golden corpus tests: verify the umami tokenizer reproduces the expected
+//! token output stored in the project corpus.
 //!
 //! The corpus files in `corpus/` contain tab-separated `input \t expected`
-//! lines, where `expected` is the reference `-pretty=test` rendering
-//! (`T{text}` tokens joined by spaces). They are generated directly from the
-//! original `unomalycli` binary.
+//! lines, where `expected` is the `test`-printer rendering (`T{text}` tokens
+//! joined by spaces).
 
 use std::path::Path;
 use umami::{Token, Tokenizer};
@@ -55,7 +54,7 @@ fn structure_corpus_matches() {
     for f in &failures {
         eprintln!("---\n{f}");
     }
-    // The structure tokenizer matches the reference essentially exactly; a
+    // The structure tokenizer matches the corpus essentially exactly; a
     // couple of pathological inputs (JSON nested past the scanner depth limit,
     // bare dates in certain positions) are documented known differences.
     assert!(

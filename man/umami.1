@@ -10,10 +10,6 @@ umami \(em log anomaly detection and structural tokenization
 \f[B]umami\f[R] learns the \f[I]structure\f[R] of streaming log events
 and surfaces only the new, changed, and anomalous lines, filtering out
 repetitive, already\-seen traffic.
-It is a clean\-room reimplementation of the \f[B]unomalycli\f[R] tool
-from Unomaly (now Cisco), derived from observable behavior and public
-documentation.
-It is not affiliated with Unomaly.
 .PP
 The detection pipeline has four stages:
 .IP "1." 3
@@ -89,7 +85,7 @@ token.
 \f[B]delimiters\f[R] \(em original line followed by a \f[B]\(ha\f[R]
 marker row marking each delimiter.
 \f[B]static\f[R] \(em structural tokens (literals and keys) joined by
-spaces; equivalent to \f[B]unomalycli \-pretty=static\f[R].
+spaces; the structure\-signature text.
 .TP
 \f[B]\(encolor\f[R]
 Enable ANSI coloring (only meaningful with \f[B]\(enpretty colors\f[R]).
@@ -261,11 +257,10 @@ An error occurred (bad argument, I/O error, test failure).
 .SH FILES
 .TP
 \f[B]corpus/structure.tsv\f[R], \f[B]corpus/legacy.tsv\f[R]
-Golden test corpora in \f[I]input\f[R]xpected* TSV format, captured from
-the reference \f[B]unomalycli\f[R] binary and used by the integration
-tests.
+Golden test corpora in \f[I]input\f[R]xpected* TSV format, used by the
+integration tests.
 .SH SEE ALSO
-\f[B]umami\f[R](3), \f[B]unomalycli\f[R](1)
+\f[B]umami\f[R](3)
 .PP
 Crate documentation: run \f[B]cargo doc \(enopen \-p umami\f[R] in the
 workspace.

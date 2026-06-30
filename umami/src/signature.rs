@@ -44,7 +44,7 @@ pub fn structure_signature(tokens: &[Token]) -> StructureHash {
 }
 
 /// Renders the structure signature in human-readable form: the structural
-/// token texts joined by single spaces (mirrors `unomalycli -pretty=static`).
+/// token texts joined by single spaces (the `static` pretty-printer form).
 pub fn structure_string(tokens: &[Token]) -> String {
     let mut out = String::new();
     for t in structural_tokens(tokens) {
@@ -94,8 +94,9 @@ mod tests {
     #[test]
     fn dynamic_parts_dont_affect_signature() {
         // Only numeric/timestamp parts are dynamic; literal words (incl.
-        // key=value *values* that are words) are part of the structure, just
-        // as the reference `unomalycli -pretty=static` shows.
+        // key=value *values* that are words) are part of the structure. Dynamic
+        // values (numbers/timestamps/IPs) are dropped while literal words are
+        // kept, the same way the `static` pretty-printer renders structure.
         let a = structure_signature(&tokenize("request id=1 took 3 ms"));
         let b = structure_signature(&tokenize("request id=2 took 9 ms"));
         assert_eq!(a, b);

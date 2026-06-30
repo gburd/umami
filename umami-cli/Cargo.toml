@@ -1,8 +1,8 @@
 [package]
 name = "umami-cli"
-description = "Command-line interface for the umami log anomaly-detection library (a reimplementation of unomalycli)."
+description = "Command-line interface for the umami log anomaly-detection library."
 readme = "../README.md"
-keywords = ["log", "anomaly", "cli", "unomaly", "observability"]
+keywords = ["log", "anomaly", "cli", "detection", "observability"]
 categories = ["command-line-utilities"]
 version.workspace = true
 edition.workspace = true

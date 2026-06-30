@@ -14,9 +14,6 @@ umami — log anomaly detection and structural tokenization
 
 **umami** learns the *structure* of streaming log events and surfaces only the
 new, changed, and anomalous lines, filtering out repetitive, already-seen traffic.
-It is a clean-room reimplementation of the **unomalycli** tool from Unomaly
-(now Cisco), derived from observable behavior and public documentation.
-It is not affiliated with Unomaly.
 
 The detection pipeline has four stages:
 
@@ -81,8 +78,8 @@ are given, lines are read from standard input.
     each dynamic (parameter) token.
     **delimiters** — original line followed by a **\^** marker row marking
     each delimiter.
-    **static** — structural tokens (literals and keys) joined by spaces;
-    equivalent to **unomalycli -pretty=static**.
+    **static** — structural tokens (literals and keys) joined by spaces; the
+    structure-signature text.
 
 **--color**
 :   Enable ANSI coloring (only meaningful with **--pretty colors**).
@@ -247,11 +244,11 @@ instead.
 # FILES
 
 **corpus/structure.tsv**, **corpus/legacy.tsv**
-:   Golden test corpora in *input*\t*expected* TSV format, captured from the
-    reference **unomalycli** binary and used by the integration tests.
+:   Golden test corpora in *input*\t*expected* TSV format, used by the
+    integration tests.
 
 # SEE ALSO
 
-**umami**(3), **unomalycli**(1)
+**umami**(3)
 
 Crate documentation: run **cargo doc --open -p umami** in the workspace.

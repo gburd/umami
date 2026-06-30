@@ -1,8 +1,8 @@
 [package]
 name = "umami"
-description = "Reusable library reimplementing the Unomaly log anomaly-detection algorithm: structural tokenization, structure signatures, per-system event profiles and anomaly classification."
+description = "Reusable library for log anomaly detection: structural tokenization, structure signatures, per-system event profiles and anomaly classification."
 readme = "README.md"
-keywords = ["log", "anomaly", "tokenizer", "observability", "unomaly"]
+keywords = ["log", "anomaly", "tokenizer", "observability", "detection"]
 categories = ["parsing", "algorithms"]
 version.workspace = true
 edition.workspace = true

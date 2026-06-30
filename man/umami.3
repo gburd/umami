@@ -18,9 +18,8 @@ umami = \(dq0.1\(dq
 \f[B]use\f[R] umami::profile::{RunningStats, ParamTracker};
 .EE
 .SH DESCRIPTION
-The \f[B]umami\f[R] library reimplements the Unomaly log
-anomaly\-detection algorithm as a clean\-room Rust crate.
-It is not affiliated with Unomaly.
+The \f[B]umami\f[R] library implements a log anomaly\-detection
+algorithm as a self\-contained Rust crate.
 .PP
 It is designed to be embedded in log\-processing pipelines.
 The high\-level entry point is \f[B]Detector\f[R], which manages
@@ -108,8 +107,8 @@ the same \f[B]StructureHash\f[R].
 .EE
 .PP
 Renders the structural tokens as a space\-joined string.
-This is the human\-readable form of the signature, equivalent to
-\f[B]unomalycli \-pretty=static\f[R].
+This is the human\-readable form of the signature (the \f[CR]static\f[R]
+printer output).
 .SS Detector
 .IP
 .EX
@@ -200,8 +199,8 @@ value is new.
 .PP
 Pretty\-printers for token sequences.
 \f[B]Pretty::render(tokens, color)\f[R] returns the formatted string.
-Used by \f[B]umami tokenize\f[R] to reproduce the output of
-\f[B]unomalycli \-pretty=\&...\f[R].
+Used by \f[B]umami tokenize\f[R] to render tokens in the supported
+pretty\-printer formats.
 .SH EXAMPLES
 .SS Minimal detector
 .IP
@@ -250,8 +249,6 @@ assert_eq!(h1, h2); \f[I]// only dynamic parts differ\f[R]
 .SH SEE ALSO
 \f[B]umami\f[R](1)
 .PP
-Source repository: https://github.com/example/umami
-.PP
-Unomaly public documentation: https://unomaly.com (not affiliated).
+Source repository: https://codeberg.org/gregburd/umami
 .SH AUTHORS
 umami contributors.

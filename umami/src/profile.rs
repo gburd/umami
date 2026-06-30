@@ -1,6 +1,6 @@
 //! Per-structure event profiles and the in-memory profile store.
 //!
-//! A [`Profile`] records everything Unomaly learns about one log-line
+//! A [`Profile`] records everything the detector learns about one log-line
 //! structure on one system: how often it occurs, when it was first and last
 //! seen, the distinct values observed for each dynamic parameter, and the
 //! frequency statistics used to detect spikes.
@@ -9,8 +9,8 @@ use crate::signature::{structure_signature, StructureHash};
 use crate::token::Token;
 use std::collections::HashMap;
 
-/// The maximum number of distinct values tracked per dynamic parameter,
-/// matching Unomaly's behavior (it tracks up to 100 values per parameter).
+/// The maximum number of distinct values tracked per dynamic parameter
+/// (up to 100 values per parameter).
 pub const MAX_PARAM_VALUES: usize = 100;
 
 /// Online mean/variance accumulator (Welford's algorithm) used for frequency
@@ -151,8 +151,8 @@ impl Profile {
     }
 
     /// Whether the profile is still "newish" — seen too few times to be
-    /// considered learned. Mirrors Unomaly's notion that a structure must
-    /// recur before it stops being highlighted.
+    /// considered learned: a structure must recur before it stops being
+    /// highlighted.
     pub fn is_newish(&self, learn_threshold: u64) -> bool {
         self.count < learn_threshold
     }

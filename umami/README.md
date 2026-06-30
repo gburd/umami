@@ -1,12 +1,8 @@
 # umami
 
-`umami` is a reusable Rust library that reimplements the
-[Unomaly](https://unomaly.com) log anomaly-detection algorithm: it learns the
+`umami` is a reusable Rust library for log anomaly detection: it learns the
 structure of streaming log events and surfaces only the *new, changed and
 anomalous* lines, filtering out the bulk of repetitive, already-seen logs.
-
-It is a clean-room reimplementation derived from the observable behavior of the
-original `unomalycli` tool and Unomaly's public documentation.
 
 ## How it works
 
@@ -52,8 +48,7 @@ assert_eq!(tokens[0].ty, TokenType::Timestamp);
 ## Crate features
 
 The core library has no required dependencies and forbids `unsafe`. A companion
-binary crate, `umami-cli`, provides a command-line interface compatible with
-`unomalycli`'s subcommands.
+binary crate, `umami-cli`, provides a command-line interface.
 
 ## License
 

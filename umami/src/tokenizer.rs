@@ -1,8 +1,7 @@
 //! The structural log-line tokenizer.
 //!
-//! This module reproduces the behavior of Unomaly's `structure` and `legacy`
-//! tokenizers as observed from the reference `unomalycli tokenize` command.
-//! Tokenization is the first stage of anomaly detection: a raw log line is
+//! This module implements the `structure` and `legacy` tokenizers. Tokenization
+//! is the first stage of anomaly detection: a raw log line is
 //! split into a sequence of typed [`Token`]s, from which a structure signature
 //! is later derived.
 //!
@@ -23,7 +22,7 @@ use crate::token::{Token, TokenType};
 /// Which tokenizer variant to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tokenizer {
-    /// The modern structural tokenizer (Unomaly 2.28+). Understands
+    /// The modern structural tokenizer. Understands
     /// key/value pairs, quoted strings and nested JSON. This is the default.
     #[default]
     Structure,

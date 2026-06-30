@@ -23,8 +23,8 @@ use umami::profile::{RunningStats, ParamTracker};
 
 # DESCRIPTION
 
-The **umami** library reimplements the Unomaly log anomaly-detection algorithm as
-a clean-room Rust crate.  It is not affiliated with Unomaly.
+The **umami** library implements a log anomaly-detection algorithm as a
+self-contained Rust crate.
 
 It is designed to be embedded in log-processing pipelines.  The high-level entry
 point is **Detector**, which manages per-system state.  Lower-level building blocks
@@ -111,7 +111,7 @@ pub fn structure_string(tokens: &[Token]) -> String
 ```
 
 Renders the structural tokens as a space-joined string.  This is the
-human-readable form of the signature, equivalent to **unomalycli -pretty=static**.
+human-readable form of the signature (the `static` printer output).
 
 ## Detector
 
@@ -202,8 +202,8 @@ pub enum Pretty { Test, Colors, Params, Delimiters, Static }
 ```
 
 Pretty-printers for token sequences.  **Pretty::render(tokens, color)** returns
-the formatted string.  Used by **umami tokenize** to reproduce the output of
-**unomalycli -pretty=…**.
+the formatted string.  Used by **umami tokenize** to render tokens in the
+supported pretty-printer formats.
 
 # EXAMPLES
 
@@ -259,6 +259,4 @@ assert_eq!(h1, h2); // only dynamic parts differ
 
 **umami**(1)
 
-Source repository: https://github.com/example/umami
-
-Unomaly public documentation: https://unomaly.com (not affiliated).
+Source repository: https://codeberg.org/gregburd/umami

@@ -2,7 +2,8 @@
 //!
 //! [`Detector`] is the high-level entry point that ties together tokenization,
 //! structure hashing and per-system profiles to classify each incoming log
-//! event. It reproduces Unomaly's anomaly taxonomy:
+//! event. It classifies each incoming log event into one of the following
+//! anomaly kinds:
 //!
 //! * **Never before seen** — a structure new to the entire environment.
 //! * **New in system** — a structure new to this system but seen elsewhere.
@@ -14,8 +15,7 @@
 //! * **System away** — a system that has stopped sending data entirely.
 //!
 //! Events that match a learned profile without triggering any of the above are
-//! *not* anomalies and are filtered out — exactly the behavior of
-//! `unomalycli`'s pipeline.
+//! *not* anomalies and are filtered out.
 
 use crate::profile::{parameter_values, ProfileStore};
 use crate::signature::{structure_signature, structure_string};

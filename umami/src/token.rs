@@ -1,17 +1,15 @@
 //! Token types and the [`Token`] structure produced by tokenizers.
 //!
-//! Unomaly's tokenizer classifies each fragment of a log line into one of a
-//! small set of [`TokenType`]s. The numeric discriminants match the values
-//! emitted by the original `unomalycli tokenize -pretty=test` output so that
-//! golden corpora can be compared directly.
+//! The tokenizer classifies each fragment of a log line into one of a small
+//! set of [`TokenType`]s. The numeric discriminants are stable so that golden
+//! corpora can be compared directly against the `test` pretty-printer output.
 
 use std::fmt;
 
 /// The classification of a single [`Token`].
 ///
 /// The numeric values are stable and match the integers printed by the
-/// reference `unomalycli` "test" pretty-printer (e.g. `0{web01}` is a
-/// [`TokenType::Literal`]).
+/// "test" pretty-printer (e.g. `0{web01}` is a [`TokenType::Literal`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum TokenType {

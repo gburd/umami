@@ -1,5 +1,5 @@
 //! `umami` — a command-line interface to the [`umami`] log anomaly-detection
-//! library, compatible with the subcommands of Unomaly's `unomalycli`.
+//! library.
 //!
 //! Run `umami --help` or `umami <command> --help` for usage.
 
@@ -13,7 +13,7 @@ use std::process::ExitCode;
 #[command(
     name = "umami",
     version,
-    about = "Log anomaly detection and structural tokenization (a reimplementation of unomalycli).",
+    about = "Log anomaly detection and structural tokenization.",
     long_about = None,
 )]
 struct Cli {
