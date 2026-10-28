@@ -6,6 +6,7 @@ pub mod detector;
 pub mod pretty;
 pub mod profile;
 pub mod signature;
+pub mod time;
 pub mod token;
 pub mod tokenizer;
 
