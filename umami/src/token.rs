@@ -127,10 +127,27 @@ impl Token {
         Self::new(TokenType::Delimiter, text)
     }
 
-    /// Returns `true` if this token contributes to the structure signature.
+    /// Returns `true` if this token contributes to the structure signature:
+    /// a structural type ([`TokenType::is_structural`]) that is not a
+    /// [dynamic literal](Token::is_parameter).
     #[inline]
     pub fn is_structural(&self) -> bool {
-        self.ty.is_structural()
+        self.ty.is_structural() && !self.is_dynamic_literal()
+    }
+
+    /// Returns `true` if this token is a dynamic parameter value: a parameter
+    /// type ([`TokenType::is_parameter`]) or a literal containing a digit
+    /// (`web01`, `/users/4815`, `15ms`, a UUID).
+    #[inline]
+    pub fn is_parameter(&self) -> bool {
+        self.ty.is_parameter() || self.is_dynamic_literal()
+    }
+
+    /// Digit-bearing literals are almost always ids, sizes or hostnames, so
+    /// they are treated as variables (the same pre-processing rule as Drain).
+    #[inline]
+    fn is_dynamic_literal(&self) -> bool {
+        self.ty == TokenType::Literal && self.text.bytes().any(|b| b.is_ascii_digit())
     }
 }
 
@@ -161,6 +178,16 @@ mod tests {
         assert!(TokenType::JsonKey.is_structural());
         assert!(!TokenType::Number.is_structural());
         assert!(!TokenType::Delimiter.is_structural());
+    }
+
+    #[test]
+    fn digit_literals_are_parameters() {
+        assert!(Token::literal("web01").is_parameter());
+        assert!(!Token::literal("web01").is_structural());
+        assert!(Token::literal("web").is_structural());
+        // keys stay structural even when they contain digits
+        assert!(Token::new(TokenType::JsonKey, "field1").is_structural());
+        assert!(!Token::delimiter("1").is_parameter());
     }
 
     #[test]

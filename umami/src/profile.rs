@@ -5,7 +5,7 @@
 //! seen, the distinct values observed for each dynamic parameter, and the
 //! frequency statistics used to detect spikes.
 
-use crate::signature::{structure_signature, StructureHash};
+use crate::signature::StructureHash;
 use crate::token::Token;
 use std::collections::HashMap;
 
@@ -77,21 +77,26 @@ pub struct ParamTracker {
 
 impl ParamTracker {
     /// Records a parameter value, returning `true` if it had not been seen
-    /// before (a parameter-change signal).
+    /// before (a parameter-change signal). Once more than
+    /// [`MAX_PARAM_VALUES`] distinct values have been seen the parameter is
+    /// treated as free-form (an id, a counter) and never signals again.
     pub fn observe(&mut self, value: &str) -> bool {
         self.total += 1;
-        if self.values.iter().any(|v| v == value) {
+        if self.saturated || self.values.iter().any(|v| v == value) {
             return false;
         }
         if self.values.len() < MAX_PARAM_VALUES {
             self.values.push(value.to_string());
+            true
         } else {
             self.saturated = true;
+            self.values = Vec::new(); // free the memory; the set is meaningless now
+            false
         }
-        true
     }
 
-    /// The distinct values observed (up to [`MAX_PARAM_VALUES`]).
+    /// The distinct values observed (up to [`MAX_PARAM_VALUES`]); empty once
+    /// saturated.
     pub fn values(&self) -> &[String] {
         &self.values
     }
@@ -101,7 +106,7 @@ impl ParamTracker {
         self.saturated
     }
 
-    /// Number of distinct values currently tracked.
+    /// Number of distinct values currently tracked (0 once saturated).
     pub fn cardinality(&self) -> usize {
         self.values.len()
     }
@@ -228,25 +233,23 @@ impl ProfileStore {
     }
 }
 
-/// Extracts the `(index, value)` pairs of dynamic parameter tokens from a
-/// tokenized line, where `index` is the token position.
+/// Extracts the `(slot, value)` pairs of dynamic parameter tokens from a
+/// tokenized line, where `slot` is the parameter's ordinal (0 for the first
+/// parameter). Lines sharing a [`StructureHash`] have the same slots, so a
+/// slot names the same field across every line of a profile.
 pub fn parameter_values(tokens: &[Token]) -> Vec<(usize, &str)> {
     tokens
         .iter()
+        .filter(|t| t.is_parameter())
+        .map(|t| t.text.as_str())
         .enumerate()
-        .filter(|(_, t)| t.ty.is_parameter())
-        .map(|(i, t)| (i, t.text.as_str()))
         .collect()
-}
-
-/// Convenience: compute the structure hash for `tokens`.
-pub fn hash_tokens(tokens: &[Token]) -> StructureHash {
-    structure_signature(tokens)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::signature::structure_signature;
     use crate::token::TokenType;
     use crate::tokenize;
 
@@ -264,19 +267,18 @@ mod tests {
     #[test]
     fn param_tracker_caps() {
         let mut p = ParamTracker::default();
-        for i in 0..150 {
-            p.observe(&i.to_string());
-        }
-        assert_eq!(p.cardinality(), MAX_PARAM_VALUES);
+        let new = (0..150).filter(|i| p.observe(&i.to_string())).count();
+        assert_eq!(new, MAX_PARAM_VALUES); // no signal past the cap
         assert!(p.is_saturated());
-        assert_eq!(p.total, 150);
+        assert!(!p.observe("0"));
+        assert_eq!(p.total, 151);
     }
 
     #[test]
     fn store_tracks_systems_and_globals() {
         let mut store = ProfileStore::new();
         let toks = tokenize("service started ok");
-        let h = hash_tokens(&toks);
+        let h = structure_signature(&toks);
         let (_, created) = store.get_or_insert("host-a", h, &toks, 0);
         assert!(created);
         assert!(store.seen_globally(h));
@@ -289,9 +291,7 @@ mod tests {
     #[test]
     fn param_values_are_dynamic_only() {
         let toks = tokenize("user=alice from 10.0.0.1 count=42");
-        let params = parameter_values(&toks);
-        // 42 is the dynamic number; alice/10.0.0.1 are literals in structure tok.
-        assert!(params.iter().any(|(_, v)| *v == "42"));
+        assert_eq!(parameter_values(&toks), vec![(0, "10.0.0.1"), (1, "42")]);
         assert!(TokenType::Number.is_parameter());
     }
 }

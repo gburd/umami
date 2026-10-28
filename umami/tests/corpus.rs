@@ -24,12 +24,20 @@ fn corpus_path(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
-fn run_corpus(file: &str, tokenizer: Tokenizer) -> (usize, usize, Vec<String>) {
+/// Inputs the legacy tokenizer is known to get wrong against the corpus. Any
+/// other mismatch, or one of these starting to pass, fails the test.
+const LEGACY_KNOWN_FAILURES: &[&str] = &[
+    r#"nested {"a":{"b":{"c":1}}} done"#,
+    "mac 00:11:22:33:44:55 time 10:23:45 date 2020-11-12",
+    r#"empty values a= b=" " c="""#,
+];
+
+fn run_corpus(file: &str, tokenizer: Tokenizer) -> (usize, Vec<String>, Vec<String>) {
     let path = corpus_path(file);
     let data =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let mut total = 0;
-    let mut matched = 0;
+    let mut failed_inputs = Vec::new();
     let mut failures = Vec::new();
     for line in data.lines() {
         let Some((input, expected)) = line.split_once('\t') else {
@@ -37,42 +45,29 @@ fn run_corpus(file: &str, tokenizer: Tokenizer) -> (usize, usize, Vec<String>) {
         };
         total += 1;
         let got = render(&tokenizer.tokenize(input));
-        if got == expected {
-            matched += 1;
-        } else if failures.len() < 20 {
+        if got != expected {
+            failed_inputs.push(input.to_string());
             failures.push(format!("IN : {input}\nEXP: {expected}\nGOT: {got}"));
         }
     }
-    (matched, total, failures)
+    (total, failed_inputs, failures)
 }
 
 #[test]
 fn structure_corpus_matches() {
-    let (matched, total, failures) = run_corpus("structure.tsv", Tokenizer::Structure);
-    let pct = 100.0 * matched as f64 / total as f64;
-    eprintln!("structure tokenizer: {matched}/{total} ({pct:.1}%)");
-    for f in &failures {
-        eprintln!("---\n{f}");
-    }
-    // The structure tokenizer matches the corpus essentially exactly; a
-    // couple of pathological inputs (JSON nested past the scanner depth limit,
-    // bare dates in certain positions) are documented known differences.
-    assert!(
-        matched as f64 / total as f64 >= 0.99,
-        "structure tokenizer corpus match rate {pct:.1}% below 99%"
-    );
+    let (total, failed, failures) = run_corpus("structure.tsv", Tokenizer::Structure);
+    assert!(total > 400, "corpus too small: {total}");
+    assert!(failed.is_empty(), "{}", failures.join("\n---\n"));
 }
 
 #[test]
 fn legacy_corpus_matches() {
-    let (matched, total, failures) = run_corpus("legacy.tsv", Tokenizer::Legacy);
-    let pct = 100.0 * matched as f64 / total as f64;
-    eprintln!("legacy tokenizer: {matched}/{total} ({pct:.1}%)");
-    for f in &failures {
-        eprintln!("---\n{f}");
-    }
-    assert!(
-        matched as f64 / total as f64 >= 0.90,
-        "legacy tokenizer corpus match rate {pct:.1}% below 90%"
+    let (total, failed, failures) = run_corpus("legacy.tsv", Tokenizer::Legacy);
+    assert!(total > 400, "corpus too small: {total}");
+    assert_eq!(
+        failed,
+        LEGACY_KNOWN_FAILURES,
+        "legacy mismatches changed:\n{}",
+        failures.join("\n---\n")
     );
 }

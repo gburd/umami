@@ -407,23 +407,26 @@ fn tokenize_structure(line: &str) -> Vec<Token> {
             continue;
         }
 
-        // 3) Quoted string: opening quote is a delimiter, contents one token,
-        //    closing quote a delimiter.
-        if c == '"' || c == '\'' {
-            tokens.push(Token::delimiter(&line[i..i + 1]));
-            i += 1;
-            let start = i;
-            while i < n && line[i..].chars().next().unwrap() != c {
-                i += line[i..].chars().next().unwrap().len_utf8();
+        // 3) Quoted string: opening quote is a delimiter, contents are
+        //    tokenized recursively (so numbers/timestamps inside quotes stay
+        //    dynamic), closing quote a delimiter. A JSON key (`"k":`) stays one
+        //    literal so `promote_keys` can see it. An apostrophe inside a word
+        //    (`can't`) or an unclosed quote is just a delimiter.
+        let at_word_start = i == 0 || !is_word_char(line[..i].chars().next_back().unwrap());
+        if c == '"' || (c == '\'' && at_word_start) {
+            if let Some(len) = line[i + 1..].find(c) {
+                let (start, end) = (i + 1, i + 1 + len);
+                tokens.push(Token::delimiter(&line[i..start]));
+                let content = &line[start..end];
+                if line[end + 1..].starts_with(':') && !content.is_empty() {
+                    tokens.push(Token::literal(content));
+                } else {
+                    tokens.extend(tokenize_structure(content));
+                }
+                tokens.push(Token::delimiter(&line[end..end + 1]));
+                i = end + 1;
+                continue;
             }
-            if i > start {
-                tokens.push(Token::new(TokenType::Literal, &line[start..i]));
-            }
-            if i < n {
-                tokens.push(Token::delimiter(&line[i..i + 1]));
-                i += 1;
-            }
-            continue;
         }
 
         // 4) Word run (letters, digits and inner word punctuation), or a
@@ -879,5 +882,24 @@ mod tests {
     #[test]
     fn whitespace_runs_merge() {
         assert_eq!(s("a   b"), "0{a} 1{   } 0{b}");
+    }
+
+    #[test]
+    fn quotes() {
+        // contents are tokenized, so dynamic values inside quotes stay dynamic
+        assert_eq!(s("msg=\"took 5 ms\""), "7{msg} 1{=} 1{\"} 0{took} 1{ } 5{5} 1{ } 0{ms} 1{\"}");
+        assert_eq!(
+            s(r#"{"ts":"2020-11-12T15:45:54Z"}"#),
+            r#"1{{} 1{"} 7{ts} 1{"} 1{:} 1{"} 2{2020-11-12T15:45:54Z} 1{"} 1{}}"#
+        );
+        // a key with spaces stays one key
+        assert_eq!(s(r#""a b":1"#), r#"1{"} 7{a b} 1{"} 1{:} 5{1}"#);
+        // apostrophes inside words are not quotes
+        assert_eq!(s("user's id=5"), "0{user} 1{'} 0{s} 1{ } 7{id} 1{=} 5{5}");
+        assert_eq!(s("'single'"), "1{'} 0{single} 1{'}");
+        // an unclosed quote does not swallow the rest of the line
+        assert_eq!(s("msg=\"open id=7"), "7{msg} 1{=} 1{\"} 0{open} 1{ } 7{id} 1{=} 5{7}");
+        assert_eq!(s("\"\""), "1{\"} 1{\"}");
+        assert_eq!(s("\"\":"), "1{\"} 1{\"} 1{:}");
     }
 }

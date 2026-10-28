@@ -18,40 +18,46 @@ impl fmt::Display for StructureHash {
     }
 }
 
-/// Returns the ordered list of structural token texts for `tokens`.
-///
-/// Structural tokens are those for which [`crate::TokenType::is_structural`] is
-/// true ([`crate::TokenType::Literal`], [`crate::TokenType::JsonKey`],
-/// [`crate::TokenType::Json`]). Delimiters and dynamic parameter tokens are
-/// dropped.
-pub fn structural_tokens(tokens: &[Token]) -> impl Iterator<Item = &Token> {
-    tokens.iter().filter(|t| t.is_structural())
+/// The text shown for a dynamic parameter slot in [`structure_string`].
+pub const PARAM_PLACEHOLDER: &str = "<*>";
+
+/// Returns the tokens that make up the signature: structural tokens
+/// ([`Token::is_structural`]) and parameter slots ([`Token::is_parameter`]),
+/// in order. Delimiters are dropped.
+pub fn signature_tokens(tokens: &[Token]) -> impl Iterator<Item = &Token> {
+    tokens.iter().filter(|t| t.is_structural() || t.is_parameter())
 }
 
 /// Computes the [`StructureHash`] for a tokenized log line.
 ///
-/// The hash combines the type and text of each structural token (in order)
-/// using the FNV-1a algorithm, which is fast, allocation-free and stable
-/// across runs and platforms.
+/// The hash combines the type and text of each structural token, and a
+/// placeholder for each parameter slot (so `foo 1 bar` and `foo bar 1`
+/// differ), using the FNV-1a algorithm, which is fast, allocation-free and
+/// stable across runs and platforms.
 pub fn structure_signature(tokens: &[Token]) -> StructureHash {
     let mut h = Fnv1a::new();
-    for t in structural_tokens(tokens) {
-        h.write_u8(t.ty.as_u8());
-        h.write(t.text.as_bytes());
+    for t in signature_tokens(tokens) {
+        if t.is_structural() {
+            h.write_u8(t.ty.as_u8());
+            h.write(t.text.as_bytes());
+        } else {
+            h.write_u8(0xfe); // parameter slot
+        }
         h.write_u8(0xff); // token separator
     }
     StructureHash(h.finish())
 }
 
-/// Renders the structure signature in human-readable form: the structural
-/// token texts joined by single spaces (the `static` pretty-printer form).
+/// Renders the structure signature in human-readable form: structural token
+/// texts and a [`PARAM_PLACEHOLDER`] per parameter, joined by single spaces
+/// (the `static` pretty-printer form).
 pub fn structure_string(tokens: &[Token]) -> String {
     let mut out = String::new();
-    for t in structural_tokens(tokens) {
+    for t in signature_tokens(tokens) {
         if !out.is_empty() {
             out.push(' ');
         }
-        out.push_str(&t.text);
+        out.push_str(if t.is_structural() { &t.text } else { PARAM_PLACEHOLDER });
     }
     out
 }
@@ -112,10 +118,21 @@ mod tests {
     #[test]
     fn static_string_drops_dynamic() {
         let toks = tokenize("Jan 23 10:23:45 web01 failed for root from 10.0.0.1 port 22");
-        let s = structure_string(&toks);
-        assert!(!s.contains("10:23:45"));
-        assert!(!s.contains("22"));
-        assert!(s.contains("web01"));
-        assert!(s.contains("failed"));
+        assert_eq!(
+            structure_string(&toks),
+            "<*> <*> failed for root from <*> port <*>"
+        );
+    }
+
+    #[test]
+    fn parameter_position_matters() {
+        let sig = |s| structure_signature(&tokenize(s));
+        assert_ne!(sig("foo 42 bar"), sig("foo bar 42"));
+        assert_ne!(sig("disk 1 2 3 full"), sig("disk full"));
+        assert_eq!(sig("GET /api/users/1 200"), sig("GET /api/users/77 404"));
+        assert_eq!(
+            sig("Accepted from 10.0.0.1 port 22"),
+            sig("Accepted from 192.168.7.9 port 2222")
+        );
     }
 }

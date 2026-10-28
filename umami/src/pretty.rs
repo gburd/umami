@@ -18,7 +18,8 @@ pub enum Pretty {
     Params,
     /// The line with a `^` marker row underneath marking each delimiter.
     Delimiters,
-    /// The structural tokens (literals/keys) joined by spaces.
+    /// The structure signature: structural tokens, with `<*>` for each
+    /// parameter, joined by spaces.
     Static,
 }
 
@@ -58,12 +59,7 @@ fn render_test(tokens: &[Token]) -> String {
 }
 
 fn render_static(tokens: &[Token]) -> String {
-    let mut out = String::new();
-    for t in tokens.iter().filter(|t| t.ty.is_structural()) {
-        out.push_str(&t.text);
-        out.push(' ');
-    }
-    out
+    crate::signature::structure_string(tokens)
 }
 
 /// ANSI color codes per token type (matching the reference palette).
@@ -148,7 +144,7 @@ mod tests {
         let toks = tokenize("user=alice from 10.0.0.1 id 42");
         assert_eq!(
             Pretty::Static.render(&toks, false),
-            "user alice from 10.0.0.1 id "
+            "user alice from <*> id <*>"
         );
     }
 
