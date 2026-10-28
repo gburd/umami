@@ -134,6 +134,9 @@ fn is_decimal(word: &str) -> bool {
     if matches!(chars.peek(), Some('+') | Some('-')) {
         chars.next();
     }
+    if chars.peek() == Some(&'.') {
+        return false; // `-.5`, like `.5`, is not a number
+    }
 
     let mut saw_digit = false;
     let mut saw_dot = false;
@@ -855,6 +858,7 @@ mod tests {
         assert!(!is_number("5GB"));
         assert!(!is_number("4ever"));
         assert!(!is_number("1.2.3"));
+        assert!(!is_number("-.5"));
         assert!(!is_number("v1"));
     }
 

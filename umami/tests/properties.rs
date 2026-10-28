@@ -105,3 +105,39 @@ proptest! {
         prop_assert_eq!(a, b);
     }
 }
+
+proptest! {
+    /// The timestamp parser never panics, on any input.
+    #[test]
+    fn parse_timestamp_never_panics(s in "\\PC{0,40}", now in proptest::num::i64::ANY) {
+        let _ = umami::time::parse_timestamp(&s, now.clamp(-1 << 40, 1 << 40));
+    }
+
+    /// Any ISO timestamp the tokenizer finds parses, to the value of its
+    /// fields.
+    #[test]
+    fn iso_round_trip(y in 1970i64..2100, mo in 1i64..=12, d in 1i64..=28, h in 0i64..24, mi in 0i64..60, s in 0i64..60) {
+        let text = format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z");
+        let toks = Tokenizer::Structure.tokenize(&format!("{text} x"));
+        prop_assert_eq!(toks[0].ty, TokenType::Timestamp);
+        let t = umami::time::event_time(&toks, 0).unwrap();
+        let days = t.div_euclid(86_400);
+        prop_assert_eq!(t.rem_euclid(86_400), h * 3600 + mi * 60 + s);
+        // the syslog form of the same instant, with an explicit year, agrees
+        const M: [&str; 12] = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+        let sys = format!("{} {d:2} {h:02}:{mi:02}:{s:02} {y}", M[(mo - 1) as usize]);
+        prop_assert_eq!(umami::time::parse_timestamp(&sys, 0), Some(t), "{}", sys);
+        prop_assert!(days >= 0);
+    }
+
+    /// Tokenizing never panics and stays lossless on arbitrary Unicode,
+    /// including quotes and apostrophes next to multibyte characters.
+    #[test]
+    fn tokenization_is_lossless_unicode(line in "[\\PC\"'=:{}]{0,60}") {
+        let line = line.trim_matches(['\n', '\r']).to_string();
+        for tok in [Tokenizer::Structure, Tokenizer::Legacy] {
+            let joined: String = tok.tokenize(&line).iter().map(|t| t.text.as_str()).collect();
+            prop_assert_eq!(&joined, &line);
+        }
+    }
+}
