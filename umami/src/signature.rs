@@ -25,7 +25,9 @@ pub const PARAM_PLACEHOLDER: &str = "<*>";
 /// ([`Token::is_structural`]) and parameter slots ([`Token::is_parameter`]),
 /// in order. Delimiters are dropped.
 pub fn signature_tokens(tokens: &[Token]) -> impl Iterator<Item = &Token> {
-    tokens.iter().filter(|t| t.is_structural() || t.is_parameter())
+    tokens
+        .iter()
+        .filter(|t| t.is_structural() || t.is_parameter())
 }
 
 /// Computes the [`StructureHash`] for a tokenized log line.
@@ -57,7 +59,11 @@ pub fn structure_string(tokens: &[Token]) -> String {
         if !out.is_empty() {
             out.push(' ');
         }
-        out.push_str(if t.is_structural() { &t.text } else { PARAM_PLACEHOLDER });
+        out.push_str(if t.is_structural() {
+            &t.text
+        } else {
+            PARAM_PLACEHOLDER
+        });
     }
     out
 }

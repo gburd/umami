@@ -175,7 +175,7 @@ fn is_decimal(word: &str) -> bool {
 // Timestamp detection
 // ---------------------------------------------------------------------------
 
-const MONTHS: [&str; 12] = [
+pub(crate) const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
@@ -887,7 +887,10 @@ mod tests {
     #[test]
     fn quotes() {
         // contents are tokenized, so dynamic values inside quotes stay dynamic
-        assert_eq!(s("msg=\"took 5 ms\""), "7{msg} 1{=} 1{\"} 0{took} 1{ } 5{5} 1{ } 0{ms} 1{\"}");
+        assert_eq!(
+            s("msg=\"took 5 ms\""),
+            "7{msg} 1{=} 1{\"} 0{took} 1{ } 5{5} 1{ } 0{ms} 1{\"}"
+        );
         assert_eq!(
             s(r#"{"ts":"2020-11-12T15:45:54Z"}"#),
             r#"1{{} 1{"} 7{ts} 1{"} 1{:} 1{"} 2{2020-11-12T15:45:54Z} 1{"} 1{}}"#
@@ -898,7 +901,10 @@ mod tests {
         assert_eq!(s("user's id=5"), "0{user} 1{'} 0{s} 1{ } 7{id} 1{=} 5{5}");
         assert_eq!(s("'single'"), "1{'} 0{single} 1{'}");
         // an unclosed quote does not swallow the rest of the line
-        assert_eq!(s("msg=\"open id=7"), "7{msg} 1{=} 1{\"} 0{open} 1{ } 7{id} 1{=} 5{7}");
+        assert_eq!(
+            s("msg=\"open id=7"),
+            "7{msg} 1{=} 1{\"} 0{open} 1{ } 7{id} 1{=} 5{7}"
+        );
         assert_eq!(s("\"\""), "1{\"} 1{\"}");
         assert_eq!(s("\"\":"), "1{\"} 1{\"} 1{:}");
     }

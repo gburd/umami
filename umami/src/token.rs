@@ -148,8 +148,7 @@ impl Token {
     /// (the Drain pre-processing rule, plus paths).
     #[inline]
     fn is_dynamic_literal(&self) -> bool {
-        self.ty == TokenType::Literal
-            && self.text.bytes().any(|b| b.is_ascii_digit() || b == b'/')
+        self.ty == TokenType::Literal && self.text.bytes().any(|b| b.is_ascii_digit() || b == b'/')
     }
 }
 
