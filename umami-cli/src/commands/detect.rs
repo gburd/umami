@@ -66,13 +66,16 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<(), Box<dyn Error>> {
 /// Runs a detection subcommand over stdin.
 ///
 /// Each line is observed at its own timestamp (see [`umami::time`]); a line
-/// without one inherits the latest time seen, or the wall clock before any.
-/// Every [`SWEEP_EVERY`] seconds of event time the detector is swept for
-/// stopped events and silent systems.
+/// without one is observed at the latest timestamp seen, or the wall clock
+/// before any. Every [`SWEEP_EVERY`] seconds of that clock the detector is
+/// swept for stopped events and silent systems.
 //
 // shortcut: sweeps only run when a line arrives, so a stream that goes fully
 // idle reports system_away when it resumes, not while idle. Read stdin on a
 // thread and sweep on a timer if live idle alerts are needed.
+// shortcut: when replaying old logs, lines before the first timestamp are
+// stamped with the wall clock, which hides system_away for that system for
+// the rest of the replay. Buffer them until the first timestamp if it matters.
 pub fn run(args: Args, format: Format) -> Result<(), Box<dyn Error>> {
     let mut cfg = DetectorConfig::default();
     cfg.tokenizer = args.tokenizer;
@@ -91,10 +94,17 @@ pub fn run(args: Args, format: Format) -> Result<(), Box<dyn Error>> {
             _ => (args.system.as_str(), raw),
         };
         let tokens = cfg.tokenizer.tokenize(line);
-        let reference = clock.unwrap_or_else(wall_clock);
-        let now = event_time(&tokens, reference).unwrap_or(reference);
-        let latest = clock.map_or(now, |c| c.max(now));
-        clock = Some(latest);
+        // Only parsed timestamps move the clock; a line without one is seen at
+        // the latest time so far, or the wall clock if there has been none.
+        let parsed = event_time(&tokens, clock.unwrap_or_else(wall_clock));
+        if let Some(t) = parsed {
+            if clock.is_none() {
+                next_sweep = i64::MIN; // switching from the wall clock to event time
+            }
+            clock = Some(clock.map_or(t, |c| c.max(t)));
+        }
+        let latest = clock.unwrap_or_else(wall_clock);
+        let now = parsed.unwrap_or(latest);
 
         if latest >= next_sweep {
             for a in det.sweep(latest) {

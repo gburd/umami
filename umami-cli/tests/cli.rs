@@ -115,5 +115,91 @@ fn load_reports_throughput() {
         .args(["load", "--count", "1000"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("throughput"));
+        .stdout(predicate::str::contains("throughput"))
+        .stdout(predicate::str::contains("profiles   4"));
+}
+
+fn heartbeats(minutes: std::ops::Range<u32>) -> String {
+    minutes
+        .map(|m| format!("2020-01-01 10:{m:02}:00 heartbeat ok\n"))
+        .collect()
+}
+
+#[test]
+fn pipeline_reports_stops_and_absence_on_event_time() {
+    let input = format!("{}2020-01-01 10:30:00 disk error\n", heartbeats(0..10));
+    umami()
+        .arg("pipeline")
+        .write_stdin(input)
+        .assert()
+        .success()
+        .stdout(
+            "never_before_seen  2020-01-01 10:00:00 heartbeat ok\n\
+             event_stop         [stdin] <*> heartbeat ok\n\
+             system_away        [stdin]\n\
+             never_before_seen  2020-01-01 10:30:00 disk error\n",
+        );
+}
+
+#[test]
+fn untimed_lines_before_the_first_timestamp_do_not_block_sweeps() {
+    let input = format!(
+        "starting up\n{}2020-01-01 10:20:00 other\n",
+        heartbeats(0..10)
+    );
+    umami()
+        .arg("pipeline")
+        .write_stdin(input)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("event_stop"));
+}
+
+#[test]
+fn tagged_systems_are_tracked_separately() {
+    let mut input = String::new();
+    for m in 0..20 {
+        input += &format!("a\t2020-01-01 10:{m:02}:00 tick\n");
+        if m < 5 {
+            input += &format!("b\t2020-01-01 10:{m:02}:00 tick\n");
+        }
+    }
+    let out = umami()
+        .args(["pipeline", "--tagged"])
+        .write_stdin(input)
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains("new_in_system"), "{stdout}");
+    assert!(stdout.contains("system_away        [b]"), "{stdout}");
+    assert!(!stdout.contains("[a]"), "{stdout}");
+}
+
+#[test]
+fn ingest_includes_hash() {
+    umami()
+        .arg("ingest")
+        .write_stdin("disk full\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::is_match(r#""hash":"[0-9a-f]{16}""#).unwrap());
+}
+
+#[test]
+fn invalid_utf8_is_replaced_not_fatal() {
+    umami()
+        .arg("pipeline")
+        .write_stdin(&b"ok line\n\xff\xfe bad\n"[..])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\u{fffd}\u{fffd} bad"));
+}
+
+#[test]
+fn unknown_tokenizer_lists_choices() {
+    umami()
+        .args(["pipeline", "--tokenizer", "bogus"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("structure, legacy"));
 }
