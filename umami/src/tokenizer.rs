@@ -369,7 +369,7 @@ fn match_syslog(s: &str) -> Option<usize> {
     if tb.first() == Some(&b' ') && is_digits(&tail[1..], 4) {
         // ensure not part of a longer number
         let after = tail.as_bytes().get(5);
-        if after.is_none_or(|c| !c.is_ascii_digit()) {
+        if after.map_or(true, |c| !c.is_ascii_digit()) {
             total += 5;
         }
     }

@@ -72,7 +72,7 @@ per second.
 
 ## Build and install
 
-**Requirements:** Rust 1.74 or later, Cargo.
+**Requirements:** Rust 1.74 or later for the library, 1.85 or later for the CLI.
 
 ```sh
 git clone https://codeberg.org/gregburd/umami
