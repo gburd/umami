@@ -136,18 +136,20 @@ impl Token {
     }
 
     /// Returns `true` if this token is a dynamic parameter value: a parameter
-    /// type ([`TokenType::is_parameter`]) or a literal containing a digit
-    /// (`web01`, `/users/4815`, `15ms`, a UUID).
+    /// type ([`TokenType::is_parameter`]) or a literal containing a digit or
+    /// a `/` (`web01`, `/var/log/x`, `15ms`, a UUID).
     #[inline]
     pub fn is_parameter(&self) -> bool {
         self.ty.is_parameter() || self.is_dynamic_literal()
     }
 
-    /// Digit-bearing literals are almost always ids, sizes or hostnames, so
-    /// they are treated as variables (the same pre-processing rule as Drain).
+    /// Digit-bearing literals are almost always ids, sizes or hostnames, and
+    /// slash-bearing ones are paths or URLs, so both are treated as variables
+    /// (the Drain pre-processing rule, plus paths).
     #[inline]
     fn is_dynamic_literal(&self) -> bool {
-        self.ty == TokenType::Literal && self.text.bytes().any(|b| b.is_ascii_digit())
+        self.ty == TokenType::Literal
+            && self.text.bytes().any(|b| b.is_ascii_digit() || b == b'/')
     }
 }
 
@@ -183,6 +185,7 @@ mod tests {
     #[test]
     fn digit_literals_are_parameters() {
         assert!(Token::literal("web01").is_parameter());
+        assert!(Token::literal("/var/log/syslog").is_parameter());
         assert!(!Token::literal("web01").is_structural());
         assert!(Token::literal("web").is_structural());
         // keys stay structural even when they contain digits
