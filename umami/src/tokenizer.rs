@@ -437,7 +437,7 @@ fn tokenize_structure(line: &str) -> Vec<Token> {
             }
             i += consume_word(&line[i..]);
             let word = &line[start..i];
-            let ty = classify_word(word, &tokens, line, i);
+            let ty = classify_word(word);
             tokens.push(Token::new(ty, word));
             continue;
         }
@@ -483,7 +483,7 @@ fn consume_word(s: &str) -> usize {
 }
 
 /// Classifies a completed word token.
-fn classify_word(word: &str, _prev: &[Token], _line: &str, _end: usize) -> TokenType {
+fn classify_word(word: &str) -> TokenType {
     if is_number(word) {
         TokenType::Number
     } else {

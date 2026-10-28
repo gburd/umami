@@ -14,7 +14,8 @@ pub enum Pretty {
     Test,
     /// The original line, optionally colorized by token type.
     Colors,
-    /// The line with a `^~~~` marker row underneath marking each token.
+    /// The line with a `^~~~` marker row underneath marking each dynamic
+    /// parameter.
     Params,
     /// The line with a `^` marker row underneath marking each delimiter.
     Delimiters,
@@ -92,8 +93,8 @@ fn render_colors(tokens: &[Token], color: bool) -> String {
 
 /// Renders the original line plus a marker row. When `delimiters_only` is true
 /// only delimiter tokens are marked (with a single `^` under their first
-/// column); otherwise every non-delimiter token is marked with `^` followed by
-/// `~` across its width.
+/// column); otherwise every parameter token ([`Token::is_parameter`]) is
+/// marked with `^` followed by `~` across its width.
 fn render_markers(tokens: &[Token], delimiters_only: bool) -> String {
     let mut line = String::new();
     let mut marks = String::new();
@@ -111,7 +112,7 @@ fn render_markers(tokens: &[Token], delimiters_only: bool) -> String {
                     marks.push(' ');
                 }
             }
-        } else if t.ty == TokenType::Delimiter {
+        } else if !t.is_parameter() {
             for _ in 0..width {
                 marks.push(' ');
             }
@@ -154,7 +155,7 @@ mod tests {
         let out = Pretty::Params.render(&toks, false);
         let (line, marks) = out.split_once('\n').unwrap();
         assert_eq!(line, "user=alice from 10.0.0.1 id 42");
-        assert_eq!(marks, "^~~~ ^~~~~ ^~~~ ^~~~~~~~ ^~ ^~");
+        assert_eq!(marks, "                ^~~~~~~~    ^~");
     }
 
     #[test]
