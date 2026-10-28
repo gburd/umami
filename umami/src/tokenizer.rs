@@ -387,7 +387,14 @@ fn match_syslog(s: &str) -> Option<usize> {
 
 fn tokenize_structure(line: &str) -> Vec<Token> {
     let line = line.trim_matches(|c: char| c == '\n' || c == '\r');
-    let mut tokens: Vec<Token> = Vec::new();
+    let mut tokens = Vec::new();
+    tokenize_structure_into(line, &mut tokens);
+    // Resolve key/value: a literal immediately followed by '=' becomes a key.
+    promote_keys(&mut tokens);
+    tokens
+}
+
+fn tokenize_structure_into(line: &str, tokens: &mut Vec<Token>) {
     let bytes = line.as_bytes();
     let mut i = 0;
     let n = bytes.len();
@@ -426,7 +433,7 @@ fn tokenize_structure(line: &str) -> Vec<Token> {
                 if line[end + 1..].starts_with(':') && !content.is_empty() {
                     tokens.push(Token::literal(content));
                 } else {
-                    tokens.extend(tokenize_structure(content));
+                    tokenize_structure_into(content, tokens);
                 }
                 tokens.push(Token::delimiter(&line[end..end + 1]));
                 i = end + 1;
@@ -458,10 +465,6 @@ fn tokenize_structure(line: &str) -> Vec<Token> {
         tokens.push(Token::delimiter(&line[i..i + clen]));
         i += clen;
     }
-
-    // Resolve key/value: a literal immediately followed by '=' becomes a key.
-    promote_keys(&mut tokens);
-    tokens
 }
 
 /// Consumes a maximal word run, including a single digit-comma-digit group so
@@ -913,5 +916,15 @@ mod tests {
         );
         assert_eq!(s("\"\""), "1{\"} 1{\"}");
         assert_eq!(s("\"\":"), "1{\"} 1{\"} 1{:}");
+        // control characters inside quotes are kept (the line is only trimmed
+        // at its ends)
+        let quoted_cr = tokenize("x \"a\r\" y");
+        assert_eq!(
+            quoted_cr
+                .iter()
+                .map(|t| t.text.as_str())
+                .collect::<String>(),
+            "x \"a\r\" y"
+        );
     }
 }
