@@ -18,12 +18,14 @@
 //! *not* anomalies and are filtered out.
 
 use crate::profile::{parameter_values, ProfileStore};
-use crate::signature::{structure_signature, structure_string};
+use crate::signature::{structure_signature, structure_string, StructureHash};
 use crate::token::Token;
 use crate::tokenizer::Tokenizer;
+use std::collections::HashSet;
 
 /// The classification assigned to a processed event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AnomalyKind {
     /// New to the entire environment.
     NeverBeforeSeen,
@@ -64,16 +66,20 @@ pub enum SpikeMagnitude {
     Large,
 }
 
-/// A detected anomaly, returned by [`Detector::observe`].
+/// A detected anomaly, returned by [`Detector::observe`] and
+/// [`Detector::sweep`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Anomaly {
     /// The system the event came from.
     pub system: String,
     /// The kind of anomaly detected.
     pub kind: AnomalyKind,
+    /// The structure the anomaly is about, or `None` for
+    /// [`AnomalyKind::SystemAway`].
+    pub hash: Option<StructureHash>,
     /// The structure signature (static tokens) of the triggering event.
     pub signature: String,
-    /// The original log line.
+    /// The original log line (empty for anomalies found by a sweep).
     pub line: String,
     /// A score in `[0, 1]` indicating how significant the anomaly is.
     pub score: f64,
@@ -81,10 +87,13 @@ pub struct Anomaly {
 
 /// Tunable thresholds controlling detection sensitivity.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct DetectorConfig {
     /// Which tokenizer variant to use.
     pub tokenizer: Tokenizer,
-    /// Number of occurrences before a profile is considered "learned".
+    /// Number of occurrences of a structure before its baseline is trusted:
+    /// frequency spikes and parameter changes are only reported once a
+    /// profile has been seen this many times.
     pub learn_threshold: u64,
     /// z-score above which a faster-than-usual arrival is a small spike.
     pub spike_small: f64,
@@ -94,6 +103,12 @@ pub struct DetectorConfig {
     pub spike_large: f64,
     /// Whether to emit parameter-change anomalies.
     pub detect_parameter_changes: bool,
+    /// [`Detector::sweep`] reports an [`AnomalyKind::EventStop`] when a
+    /// periodic structure has been silent for this many mean intervals.
+    pub stop_factor: f64,
+    /// [`Detector::sweep`] reports an [`AnomalyKind::SystemAway`] when a
+    /// system has sent nothing for this many seconds.
+    pub away_secs: i64,
 }
 
 impl Default for DetectorConfig {
@@ -105,6 +120,8 @@ impl Default for DetectorConfig {
             spike_medium: 6.0,
             spike_large: 12.0,
             detect_parameter_changes: false,
+            stop_factor: 3.0,
+            away_secs: 600,
         }
     }
 }
@@ -114,23 +131,27 @@ impl Default for DetectorConfig {
 pub struct Detector {
     config: DetectorConfig,
     store: ProfileStore,
+    /// Systems already reported as away, until they send again.
+    away: HashSet<String>,
 }
 
 impl Detector {
     /// Creates a detector with default configuration.
     pub fn new() -> Self {
-        Self {
-            config: DetectorConfig::default(),
-            store: ProfileStore::new(),
-        }
+        Self::default()
     }
 
     /// Creates a detector with a custom configuration.
     pub fn with_config(config: DetectorConfig) -> Self {
         Self {
             config,
-            store: ProfileStore::new(),
+            ..Self::default()
         }
+    }
+
+    /// The detector's configuration.
+    pub fn config(&self) -> &DetectorConfig {
+        &self.config
     }
 
     /// Access the underlying profile store.
@@ -171,17 +192,22 @@ impl Detector {
         };
 
         let cfg = self.config;
+        self.away.remove(system);
         let (profile, _created) = self.store.get_or_insert(system, hash, tokens, now);
+        let learned = !profile.is_newish(cfg.learn_threshold);
 
-        // Update frequency stats from the inter-arrival interval.
+        // Update frequency stats from the inter-arrival interval. A gap that
+        // sweep() already reported as a stop is an outage, not the rhythm.
         let mut spike: Option<SpikeMagnitude> = None;
-        if profile.count > 0 {
+        if profile.count > 0 && !profile.stop_reported {
             let interval = (now - profile.last_seen).max(0) as f64;
             let z = profile.interval_stats.zscore(interval);
             // A spike = arrivals *faster* than usual => interval well *below*
             // the mean => strongly negative z-score.
             let neg = -z;
-            spike = if neg >= cfg.spike_large {
+            spike = if !learned {
+                None
+            } else if neg >= cfg.spike_large {
                 Some(SpikeMagnitude::Large)
             } else if neg >= cfg.spike_medium {
                 Some(SpikeMagnitude::Medium)
@@ -197,15 +223,14 @@ impl Detector {
         let mut param_changed = false;
         for (idx, value) in parameter_values(tokens) {
             let tracker = profile.params.entry(idx).or_default();
-            // Only count as a change once the profile is established.
-            let is_new = tracker.observe(value);
-            if is_new && profile.count > 0 {
+            if tracker.observe(value) && learned {
                 param_changed = true;
             }
         }
 
         profile.count += 1;
         profile.last_seen = now;
+        profile.stop_reported = false;
 
         let signature = if structural_kind.is_some() {
             structure_string(tokens)
@@ -227,43 +252,53 @@ impl Detector {
         kind.map(|kind| Anomaly {
             system: system.to_string(),
             kind,
+            hash: Some(hash),
             signature,
             line: line.to_string(),
             score: score_for(kind),
         })
     }
 
-    /// Scans all known profiles for systems/events that have gone silent.
+    /// Reports systems and periodic events that have gone silent as of `now`.
+    /// Call it regularly (say once a minute of event time); each silence is
+    /// reported once, until the structure or system is seen again.
     ///
-    /// * An [`AnomalyKind::EventStop`] is reported for a periodic profile whose
-    ///   silence exceeds `stop_factor` times its mean interval.
+    /// * An [`AnomalyKind::EventStop`] is reported for a periodic profile
+    ///   (see [`crate::Profile::is_periodic`]) silent for more than
+    ///   [`DetectorConfig::stop_factor`] times its mean interval.
     /// * An [`AnomalyKind::SystemAway`] is reported for a system whose most
-    ///   recent event is older than `away_secs`.
-    pub fn sweep(&self, now: i64, stop_factor: f64, away_secs: i64) -> Vec<Anomaly> {
+    ///   recent event is more than [`DetectorConfig::away_secs`] old.
+    pub fn sweep(&mut self, now: i64) -> Vec<Anomaly> {
+        let cfg = self.config;
         let mut out = Vec::new();
-        for (system, profiles) in self.store.iter_systems() {
+        for (system, profiles) in self.store.iter_systems_mut() {
             let mut latest = i64::MIN;
-            for profile in profiles.values() {
+            for profile in profiles.values_mut() {
                 latest = latest.max(profile.last_seen);
-                if let Some(mean) = profile.mean_interval() {
-                    if mean > 0.0 {
-                        let silent = (now - profile.last_seen) as f64;
-                        if silent > stop_factor * mean {
-                            out.push(Anomaly {
-                                system: system.clone(),
-                                kind: AnomalyKind::EventStop,
-                                signature: profile.signature.clone(),
-                                line: String::new(),
-                                score: score_for(AnomalyKind::EventStop),
-                            });
-                        }
-                    }
+                let silent = (now - profile.last_seen) as f64;
+                if !profile.stop_reported
+                    && profile.is_periodic()
+                    && silent > cfg.stop_factor * profile.interval_stats.mean
+                {
+                    profile.stop_reported = true;
+                    out.push(Anomaly {
+                        system: system.clone(),
+                        kind: AnomalyKind::EventStop,
+                        hash: Some(profile.hash),
+                        signature: profile.signature.clone(),
+                        line: String::new(),
+                        score: score_for(AnomalyKind::EventStop),
+                    });
                 }
             }
-            if latest != i64::MIN && now - latest > away_secs {
+            if latest != i64::MIN
+                && now - latest > cfg.away_secs
+                && self.away.insert(system.clone())
+            {
                 out.push(Anomaly {
                     system: system.clone(),
                     kind: AnomalyKind::SystemAway,
+                    hash: None,
                     signature: String::new(),
                     line: String::new(),
                     score: score_for(AnomalyKind::SystemAway),
@@ -289,6 +324,8 @@ fn score_for(kind: AnomalyKind) -> f64 {
 }
 
 #[cfg(test)]
+// DetectorConfig is non_exhaustive: callers build it from Default and assign.
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 
@@ -331,5 +368,79 @@ mod tests {
             a.map(|x| x.kind),
             Some(AnomalyKind::ParameterChange)
         ));
+    }
+
+    #[test]
+    fn learn_threshold_delays_parameter_changes() {
+        let mut cfg = DetectorConfig::default();
+        cfg.detect_parameter_changes = true;
+        cfg.learn_threshold = 3;
+        let mut d = Detector::with_config(cfg);
+        let kinds: Vec<_> = (0..5)
+            .map(|i| d.observe("h", &format!("temp {i}"), i).map(|a| a.kind))
+            .collect();
+        use AnomalyKind::*;
+        assert_eq!(
+            kinds,
+            [
+                Some(NeverBeforeSeen),
+                None,
+                None,
+                Some(ParameterChange),
+                Some(ParameterChange)
+            ]
+        );
+    }
+
+    #[test]
+    fn spike_on_early_arrival_of_periodic_event() {
+        let mut d = Detector::new();
+        let mut t = 0;
+        for i in 0..20 {
+            t += 60 + i % 2; // every 60-61 s
+            assert_eq!(
+                d.observe("h", "heartbeat ok", t).map(|a| a.kind),
+                (i == 0).then_some(AnomalyKind::NeverBeforeSeen)
+            );
+        }
+        let a = d.observe("h", "heartbeat ok", t + 1).unwrap();
+        assert_eq!(a.kind, AnomalyKind::FrequencySpike(SpikeMagnitude::Large));
+    }
+
+    #[test]
+    fn sweep_reports_each_silence_once() {
+        let mut d = Detector::new();
+        for i in 0..10 {
+            d.observe("h", "heartbeat ok", i * 60);
+        }
+        d.observe("h", "something else", 540);
+        assert!(d.sweep(600).is_empty());
+        let kinds = |v: Vec<Anomaly>| v.into_iter().map(|a| a.kind).collect::<Vec<_>>();
+        // 3 mean intervals (180 s) of silence -> the heartbeat stopped
+        assert_eq!(kinds(d.sweep(800)), [AnomalyKind::EventStop]);
+        assert!(d.sweep(900).is_empty());
+        // 600 s with nothing at all -> the system is away
+        assert_eq!(kinds(d.sweep(1200)), [AnomalyKind::SystemAway]);
+        assert!(d.sweep(1300).is_empty());
+        // it comes back, then stops again: both are reported again
+        for i in 0..3 {
+            d.observe("h", "heartbeat ok", 1300 + i * 60);
+        }
+        assert_eq!(
+            kinds(d.sweep(3000)),
+            [AnomalyKind::EventStop, AnomalyKind::SystemAway]
+        );
+    }
+
+    #[test]
+    fn bursty_events_do_not_stop() {
+        let mut d = Detector::new();
+        for t in [0, 1, 2, 300, 301, 302, 900, 901] {
+            d.observe("h", "burst", t);
+        }
+        assert!(d
+            .sweep(5000)
+            .iter()
+            .all(|a| a.kind != AnomalyKind::EventStop));
     }
 }

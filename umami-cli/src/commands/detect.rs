@@ -1,0 +1,188 @@
+//! `umami pipeline`, `sim` and `ingest`: stream log lines through the
+//! detector. The three differ only in how they print what it finds.
+
+use clap::Args as ClapArgs;
+use std::collections::BTreeMap;
+use std::error::Error;
+use std::io::{self, Write};
+use std::time::{SystemTime, UNIX_EPOCH};
+use umami::{time::event_time, Anomaly, AnomalyKind, Detector, DetectorConfig, Tokenizer};
+
+/// How often, in seconds of event time, to look for silent events and systems.
+const SWEEP_EVERY: i64 = 60;
+
+/// Options shared by `pipeline`, `sim` and `ingest`.
+#[derive(ClapArgs)]
+pub struct Args {
+    /// System name for untagged lines.
+    #[arg(long, default_value = "stdin")]
+    system: String,
+
+    /// Read each line as `system<TAB>line`, to multiplex several systems on
+    /// one stream. Lines without a tab use `--system`.
+    #[arg(long)]
+    tagged: bool,
+
+    /// Tokenizer to use.
+    #[arg(long, default_value = "structure", value_parser = super::tokenizer_arg())]
+    tokenizer: Tokenizer,
+
+    /// Also report parameter changes (new values on known structures).
+    #[arg(long)]
+    parameters: bool,
+}
+
+/// `pipeline` options.
+#[derive(ClapArgs)]
+pub struct PipelineArgs {
+    #[command(flatten)]
+    common: Args,
+
+    /// Print every line, prefixed with its classification (or `ok`).
+    #[arg(long)]
+    show_all: bool,
+}
+
+/// How results are printed.
+#[derive(Clone, Copy)]
+pub enum Format {
+    /// `pipeline`: the kind, then the line.
+    Text {
+        /// Also print normal lines, as `ok`.
+        show_all: bool,
+    },
+    /// `ingest`: one JSON object per anomaly.
+    Json,
+    /// `sim`: counts by kind, at the end.
+    Summary,
+}
+
+/// Runs `pipeline`.
+pub fn run_pipeline(args: PipelineArgs) -> Result<(), Box<dyn Error>> {
+    let show_all = args.show_all;
+    run(args.common, Format::Text { show_all })
+}
+
+/// Runs a detection subcommand over stdin.
+///
+/// Each line is observed at its own timestamp (see [`umami::time`]); a line
+/// without one inherits the latest time seen, or the wall clock before any.
+/// Every [`SWEEP_EVERY`] seconds of event time the detector is swept for
+/// stopped events and silent systems.
+//
+// shortcut: sweeps only run when a line arrives, so a stream that goes fully
+// idle reports system_away when it resumes, not while idle. Read stdin on a
+// thread and sweep on a timer if live idle alerts are needed.
+pub fn run(args: Args, format: Format) -> Result<(), Box<dyn Error>> {
+    let mut cfg = DetectorConfig::default();
+    cfg.tokenizer = args.tokenizer;
+    cfg.detect_parameter_changes = args.parameters;
+    let mut det = Detector::with_config(cfg);
+
+    let mut out = io::BufWriter::new(io::stdout().lock());
+    let mut counts: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let (mut events, mut flagged) = (0u64, 0u64);
+    let mut clock: Option<i64> = None;
+    let mut next_sweep = i64::MIN;
+
+    super::for_each_line(io::stdin().lock(), |raw, more| {
+        let (system, line) = match raw.split_once('\t') {
+            Some((s, l)) if args.tagged => (s, l),
+            _ => (args.system.as_str(), raw),
+        };
+        let tokens = cfg.tokenizer.tokenize(line);
+        let reference = clock.unwrap_or_else(wall_clock);
+        let now = event_time(&tokens, reference).unwrap_or(reference);
+        let latest = clock.map_or(now, |c| c.max(now));
+        clock = Some(latest);
+
+        if latest >= next_sweep {
+            for a in det.sweep(latest) {
+                *counts.entry(a.kind.as_str()).or_default() += 1;
+                print(&mut out, format, &a)?;
+            }
+            next_sweep = latest + SWEEP_EVERY;
+        }
+
+        events += 1;
+        match det.observe_tokens(system, line, &tokens, now) {
+            Some(a) => {
+                flagged += 1;
+                *counts.entry(a.kind.as_str()).or_default() += 1;
+                print(&mut out, format, &a)?;
+            }
+            None if matches!(format, Format::Text { show_all: true }) => {
+                writeln!(out, "{:<18} {line}", "ok")?;
+            }
+            None => {}
+        }
+        if !more {
+            out.flush()?;
+        }
+        Ok(())
+    })?;
+
+    if let Format::Summary = format {
+        writeln!(out, "events:    {events}")?;
+        writeln!(out, "anomalies: {flagged}")?;
+        let reduction = if events > 0 {
+            100.0 * (1.0 - flagged as f64 / events as f64)
+        } else {
+            0.0
+        };
+        writeln!(out, "reduction: {reduction:.1}%")?;
+        writeln!(out, "profiles:  {}", det.store().profile_count())?;
+        for (kind, n) in counts {
+            writeln!(out, "  {kind:<18} {n}")?;
+        }
+    }
+    out.flush()?;
+    Ok(())
+}
+
+fn wall_clock() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+fn print(out: &mut impl Write, format: Format, a: &Anomaly) -> io::Result<()> {
+    let kind = a.kind.as_str();
+    match format {
+        // found by a sweep: there is no line, so say which system and structure
+        Format::Text { .. } if matches!(a.kind, AnomalyKind::EventStop | AnomalyKind::SystemAway) => {
+            let msg = format!("{kind:<18} [{}] {}", a.system, a.signature);
+            writeln!(out, "{}", msg.trim_end())
+        }
+        Format::Text { .. } => writeln!(out, "{kind:<18} {}", a.line),
+        Format::Json => writeln!(
+            out,
+            "{{\"system\":{},\"kind\":\"{kind}\",\"score\":{:.2},\"hash\":{},\"signature\":{},\"line\":{}}}",
+            json_str(&a.system),
+            a.score,
+            a.hash.map_or("null".to_string(), |h| format!("\"{h}\"")),
+            json_str(&a.signature),
+            json_str(&a.line),
+        ),
+        Format::Summary => Ok(()),
+    }
+}
+
+/// Minimal JSON string escaping (no external dependency).
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}

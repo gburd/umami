@@ -7,7 +7,7 @@
 
 use crate::signature::StructureHash;
 use crate::token::Token;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// The maximum number of distinct values tracked per dynamic parameter
 /// (up to 100 values per parameter).
@@ -130,6 +130,9 @@ pub struct Profile {
     /// Inter-arrival time statistics (seconds between consecutive events),
     /// used to detect frequency spikes and stops.
     pub interval_stats: RunningStats,
+    /// Set by [`crate::Detector::sweep`] once this profile's silence has been
+    /// reported, until it is seen again.
+    pub(crate) stop_reported: bool,
 }
 
 impl Profile {
@@ -143,7 +146,16 @@ impl Profile {
             last_seen: now,
             params: HashMap::new(),
             interval_stats: RunningStats::default(),
+            stop_reported: false,
         }
+    }
+
+    /// Whether the structure arrives at a steady rate: at least 3 intervals,
+    /// with a standard deviation under half their mean. Only periodic
+    /// profiles are reported as [stopped](crate::AnomalyKind::EventStop).
+    pub fn is_periodic(&self) -> bool {
+        let s = &self.interval_stats;
+        s.count >= 3 && s.mean > 0.0 && s.stddev() < 0.5 * s.mean
     }
 
     /// Average inter-arrival interval in seconds, if known.
@@ -169,7 +181,7 @@ pub struct ProfileStore {
     systems: HashMap<String, HashMap<StructureHash, Profile>>,
     /// Structure hashes ever seen across *all* systems (for "never before
     /// seen" vs "new in system" classification).
-    global_hashes: HashMap<StructureHash, u64>,
+    global_hashes: HashSet<StructureHash>,
 }
 
 impl ProfileStore {
@@ -195,6 +207,12 @@ impl ProfileStore {
         self.systems.iter()
     }
 
+    pub(crate) fn iter_systems_mut(
+        &mut self,
+    ) -> impl Iterator<Item = (&String, &mut HashMap<StructureHash, Profile>)> {
+        self.systems.iter_mut()
+    }
+
     /// Returns the profile for `hash` on `system`, if present.
     pub fn get(&self, system: &str, hash: StructureHash) -> Option<&Profile> {
         self.systems.get(system)?.get(&hash)
@@ -202,7 +220,7 @@ impl ProfileStore {
 
     /// Whether `hash` has ever been seen on any system.
     pub fn seen_globally(&self, hash: StructureHash) -> bool {
-        self.global_hashes.contains_key(&hash)
+        self.global_hashes.contains(&hash)
     }
 
     /// Whether `hash` has been seen on the given `system`.
@@ -222,7 +240,7 @@ impl ProfileStore {
         tokens: &[Token],
         now: i64,
     ) -> (&mut Profile, bool) {
-        *self.global_hashes.entry(hash).or_insert(0) += 1;
+        self.global_hashes.insert(hash);
         let map = self.systems.entry(system.to_string()).or_default();
         let mut created = false;
         let profile = map.entry(hash).or_insert_with(|| {

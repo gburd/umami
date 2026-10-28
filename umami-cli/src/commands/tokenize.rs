@@ -9,13 +9,13 @@ use umami::{Pretty, Tokenizer};
 /// Arguments for the `tokenize` subcommand.
 #[derive(ClapArgs)]
 pub struct Args {
-    /// Name of the tokenizer to use: `structure` (default) or `legacy`.
-    #[arg(long, default_value = "structure")]
-    tokenizer: String,
+    /// Tokenizer to use.
+    #[arg(long, default_value = "structure", value_parser = super::tokenizer_arg())]
+    tokenizer: Tokenizer,
 
-    /// Pretty-printer: `test`, `colors`, `params`, `delimiters` or `static`.
-    #[arg(long, default_value = "test")]
-    pretty: String,
+    /// Pretty-printer.
+    #[arg(long, default_value = "test", value_parser = super::pretty_arg())]
+    pretty: Pretty,
 
     /// Colorize output (only affects the `colors` printer).
     #[arg(long)]
@@ -42,32 +42,26 @@ pub struct Args {
 
 /// Runs the `tokenize` subcommand.
 pub fn run(args: Args) -> Result<(), Box<dyn Error>> {
-    let tokenizer = Tokenizer::from_name(&args.tokenizer)
-        .ok_or_else(|| format!("unknown tokenizer: {}", args.tokenizer))?;
-    let pretty = Pretty::from_name(&args.pretty)
-        .ok_or_else(|| format!("unknown pretty printer: {}", args.pretty))?;
+    let (tokenizer, pretty) = (args.tokenizer, args.pretty);
 
     if let Some(path) = args.test {
         return run_test_file(&path, tokenizer, args.fix, args.verbose);
     }
 
-    let stdout = std::io::stdout();
-    let mut out = std::io::BufWriter::new(stdout.lock());
+    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
 
     if args.lines.is_empty() {
-        // Stream stdin line by line for low memory use.
-        let stdin = std::io::stdin();
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let n = std::io::BufRead::read_line(&mut stdin.lock(), &mut line)?;
-            if n == 0 {
-                break;
+        super::for_each_line(std::io::stdin().lock(), |line, more| {
+            writeln!(
+                out,
+                "{}",
+                pretty.render(&tokenizer.tokenize(line), args.color)
+            )?;
+            if !more {
+                out.flush()?;
             }
-            let trimmed = line.trim_end_matches(['\n', '\r']);
-            let tokens = tokenizer.tokenize(trimmed);
-            writeln!(out, "{}", pretty.render(&tokens, args.color))?;
-        }
+            Ok(())
+        })?;
     } else {
         for line in &args.lines {
             let tokens = tokenizer.tokenize(line);

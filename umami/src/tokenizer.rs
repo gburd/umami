@@ -242,10 +242,7 @@ fn match_iso(s: &str) -> Option<usize> {
         return None;
     }
     let mut i = 11;
-    match match_hms(&s[i..]) {
-        Some(n) => i += n,
-        None => return None,
-    }
+    i += match_hms(&s[i..])?;
     // fractional seconds
     if i < b.len() && (b[i] == b'.' || b[i] == b',') {
         let mut j = i + 1;
@@ -297,10 +294,7 @@ fn match_clf(s: &str) -> Option<usize> {
     }
     // HH:MM:SS after the colon at index 8
     let mut i = 3 + 9; // up to and including ':'
-    match match_hms(&s[i..]) {
-        Some(n) => i += n,
-        None => return None,
-    }
+    i += match_hms(&s[i..])?;
     // optional " ±HHMM"
     let tail = &s[i..];
     let tb = tail.as_bytes();

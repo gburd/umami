@@ -12,9 +12,9 @@ pub struct Args {
     #[arg(long, default_value_t = 1_000_000)]
     count: u64,
 
-    /// Tokenizer to use: `structure` or `legacy`.
-    #[arg(long, default_value = "structure")]
-    tokenizer: String,
+    /// Tokenizer to use.
+    #[arg(long, default_value = "structure", value_parser = super::tokenizer_arg())]
+    tokenizer: Tokenizer,
 
     /// Read lines from stdin instead of generating synthetic data.
     #[arg(long)]
@@ -23,16 +23,17 @@ pub struct Args {
 
 /// Runs the `load` subcommand.
 pub fn run(args: Args) -> Result<(), Box<dyn Error>> {
-    let tokenizer = Tokenizer::from_name(&args.tokenizer)
-        .ok_or_else(|| format!("unknown tokenizer: {}", args.tokenizer))?;
-    let cfg = DetectorConfig {
-        tokenizer,
-        ..Default::default()
-    };
+    let mut cfg = DetectorConfig::default();
+    cfg.tokenizer = args.tokenizer;
     let mut detector = Detector::with_config(cfg);
 
     let lines: Vec<String> = if args.stdin {
-        super::read_stdin_lines()?
+        let mut v = Vec::new();
+        super::for_each_line(std::io::stdin().lock(), |l, _| {
+            v.push(l.to_string());
+            Ok(())
+        })?;
+        v
     } else {
         synth(args.count)
     };
@@ -45,26 +46,30 @@ pub fn run(args: Args) -> Result<(), Box<dyn Error>> {
         }
     }
     let elapsed = start.elapsed();
-    let n = lines.len() as f64;
-    let rate = n / elapsed.as_secs_f64();
+    let rate = lines.len() as f64 / elapsed.as_secs_f64();
     println!("processed {} events in {:.3?}", lines.len(), elapsed);
     println!("throughput {rate:.0} events/sec");
     println!("anomalies  {anomalies}");
+    println!("profiles   {}", detector.store().profile_count());
     Ok(())
 }
 
-/// Generates `count` semi-repetitive synthetic log lines.
+/// Generates `count` synthetic log lines from a handful of templates, varying
+/// only their parameters, so the run measures steady-state filtering rather
+/// than profile creation.
 fn synth(count: u64) -> Vec<String> {
-    let templates = [
-        "GET /api/v2/users/{} HTTP/1.1 200 {}",
-        "level=info msg=ok host=node{} latency={}",
-        "Jan 23 10:23:45 web01 sshd[{}]: Accepted publickey for deploy port {}",
-        "disk usage at {} percent on /dev/sda{}",
-    ];
     (0..count)
-        .map(|i| {
-            let t = templates[(i % templates.len() as u64) as usize];
-            t.replace("{}", &i.to_string())
+        .map(|i| match i % 4 {
+            0 => format!("GET /api/v2/users/{i} HTTP/1.1 200 {}", i % 5000),
+            1 => format!("level=info msg=ok host=node{} latency={}ms", i % 16, i % 900),
+            2 => format!(
+                "Jan 23 10:23:45 web01 sshd[{}]: Accepted publickey for deploy from 10.0.{}.{} port {}",
+                i % 30000,
+                i % 256,
+                i % 200,
+                1024 + i % 60000
+            ),
+            _ => format!("disk usage at {} percent on /dev/sda{}", i % 100, i % 4),
         })
         .collect()
 }

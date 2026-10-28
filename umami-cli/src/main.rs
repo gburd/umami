@@ -25,27 +25,35 @@ struct Cli {
 enum Commands {
     /// Show the tokenized output of input log lines.
     Tokenize(commands::tokenize::Args),
-    /// Feed logs through the detection pipeline and print anomalies.
-    Pipeline(commands::pipeline::Args),
-    /// Simulate a stream and summarize anomalies by type.
-    Sim(commands::sim::Args),
-    /// Read log lines and emit per-system anomaly events as JSON lines.
-    Ingest(commands::ingest::Args),
+    /// Stream logs through the detector and print anomalous lines.
+    Pipeline(commands::detect::PipelineArgs),
+    /// Stream logs through the detector and summarize anomalies by type.
+    Sim(commands::detect::Args),
+    /// Stream logs through the detector and emit anomalies as JSON lines.
+    Ingest(commands::detect::Args),
     /// Load-test the detector and report throughput.
     Load(commands::load::Args),
 }
 
 fn main() -> ExitCode {
+    use commands::detect::{run, run_pipeline, Format};
     let cli = Cli::parse();
     let result = match cli.command {
         Commands::Tokenize(args) => commands::tokenize::run(args),
-        Commands::Pipeline(args) => commands::pipeline::run(args),
-        Commands::Sim(args) => commands::sim::run(args),
-        Commands::Ingest(args) => commands::ingest::run(args),
+        Commands::Pipeline(args) => run_pipeline(args),
+        Commands::Sim(args) => run(args, Format::Summary),
+        Commands::Ingest(args) => run(args, Format::Json),
         Commands::Load(args) => commands::load::run(args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
+        // a closed pipe (`umami ... | head`) is a normal way to stop
+        Err(e)
+            if e.downcast_ref::<std::io::Error>().map(|e| e.kind())
+                == Some(std::io::ErrorKind::BrokenPipe) =>
+        {
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("umami: {e}");
             ExitCode::FAILURE
