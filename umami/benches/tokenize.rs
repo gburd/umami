@@ -17,10 +17,7 @@ fn bench(c: &mut Criterion) {
     let bytes: usize = corpus.iter().map(|l| l.len()).sum();
 
     for tok in [Tokenizer::Structure, Tokenizer::Legacy] {
-        let name = match tok {
-            Tokenizer::Structure => "structure",
-            Tokenizer::Legacy => "legacy",
-        };
+        let name = tok.name();
         let mut group = c.benchmark_group(format!("tokenize/{name}"));
         group.throughput(Throughput::Bytes(bytes as u64));
         group.bench_function("10k_lines", |b| {

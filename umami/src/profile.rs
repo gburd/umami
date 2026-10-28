@@ -16,6 +16,7 @@ pub const MAX_PARAM_VALUES: usize = 100;
 /// Online mean/variance accumulator (Welford's algorithm) used for frequency
 /// z-scores.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RunningStats {
     /// Number of samples observed.
     pub count: u64,
@@ -65,6 +66,7 @@ impl RunningStats {
 
 /// Tracks the distinct values seen for a single dynamic parameter position.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ParamTracker {
     /// Distinct values observed, capped at [`MAX_PARAM_VALUES`].
     values: Vec<String>,
@@ -114,6 +116,7 @@ impl ParamTracker {
 
 /// A learned profile for one log-line structure on one system.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Profile {
     /// The structure hash this profile represents.
     pub hash: StructureHash,
@@ -177,6 +180,7 @@ impl Profile {
 
 /// An in-memory, per-system store of profiles keyed by structure hash.
 #[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ProfileStore {
     systems: HashMap<String, HashMap<StructureHash, Profile>>,
     /// Structure hashes ever seen across *all* systems (for "never before

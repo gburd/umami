@@ -10,6 +10,7 @@ use std::hash::Hasher;
 
 /// A 64-bit structure hash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct StructureHash(pub u64);
 
 impl fmt::Display for StructureHash {

@@ -41,6 +41,14 @@ impl Tokenizer {
         }
     }
 
+    /// The name accepted by [`Tokenizer::from_name`].
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Structure => "structure",
+            Self::Legacy => "legacy",
+        }
+    }
+
     /// Tokenizes a single log line into a sequence of [`Token`]s.
     pub fn tokenize(self, line: &str) -> Vec<Token> {
         match self {

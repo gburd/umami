@@ -149,6 +149,16 @@ impl Detector {
         }
     }
 
+    /// Creates a detector that resumes from previously learned `store` (see
+    /// [`Detector::store`] and the `serde` feature).
+    pub fn with_store(config: DetectorConfig, store: ProfileStore) -> Self {
+        Self {
+            config,
+            store,
+            ..Self::default()
+        }
+    }
+
     /// The detector's configuration.
     pub fn config(&self) -> &DetectorConfig {
         &self.config
@@ -259,7 +269,8 @@ impl Detector {
         })
     }
 
-    /// Reports systems and periodic events that have gone silent as of `now`.
+    /// Reports systems and periodic events that have gone silent as of `now`,
+    /// ordered by system, each system's stopped events before its absence.
     /// Call it regularly (say once a minute of event time); each silence is
     /// reported once, until the structure or system is seen again.
     ///
@@ -305,6 +316,9 @@ impl Detector {
                 });
             }
         }
+        // HashMap order varies between runs; keep the output reproducible.
+        // SystemAway has no hash, and sorts after the system's stops.
+        out.sort_by_key(|a| (a.system.clone(), a.hash.map_or(u64::MAX, |h| h.0)));
         out
     }
 }
@@ -442,5 +456,41 @@ mod tests {
             .sweep(5000)
             .iter()
             .all(|a| a.kind != AnomalyKind::EventStop));
+    }
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod serde_tests {
+    use super::*;
+
+    #[test]
+    fn learned_state_survives_a_round_trip() {
+        let mut d = Detector::new();
+        for i in 0..10 {
+            d.observe("h", &format!("heartbeat {i} ok"), i * 60);
+        }
+        let json = serde_json::to_string(d.store()).unwrap();
+        let store: ProfileStore = serde_json::from_str(&json).unwrap();
+        let mut d = Detector::with_store(DetectorConfig::default(), store);
+        assert_eq!(d.observe("h", "heartbeat 99 ok", 600), None);
+        assert_eq!(
+            d.observe("other", "heartbeat 1 ok", 600).map(|a| a.kind),
+            Some(AnomalyKind::NewInSystem)
+        );
+        // the learned rhythm came back too
+        let found: Vec<_> = d
+            .sweep(2000)
+            .into_iter()
+            .map(|a| (a.system, a.kind))
+            .collect();
+        use AnomalyKind::*;
+        assert_eq!(
+            found,
+            [
+                ("h".into(), EventStop),
+                ("h".into(), SystemAway),
+                ("other".into(), SystemAway)
+            ]
+        );
     }
 }

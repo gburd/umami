@@ -203,3 +203,43 @@ fn unknown_tokenizer_lists_choices() {
         .failure()
         .stderr(predicate::str::contains("structure, legacy"));
 }
+
+#[test]
+fn state_file_carries_learning_across_runs() {
+    let dir = std::env::temp_dir().join(format!("umami-cli-state-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let state = dir.join("state.json");
+    let _ = std::fs::remove_file(&state);
+    let run = |input: &str, extra: &[&str]| {
+        let out = umami()
+            .args(["pipeline", "--state", state.to_str().unwrap()])
+            .args(extra)
+            .write_stdin(input.to_string())
+            .assert();
+        String::from_utf8(out.get_output().stdout.clone()).unwrap()
+    };
+    assert!(run("disk full on sda1\n", &[]).contains("never_before_seen"));
+    // learned last time: filtered now
+    assert_eq!(run("disk full on sda2\n", &[]), "");
+    // a state saved by another tokenizer is refused, not silently misused
+    umami()
+        .args([
+            "pipeline",
+            "--tokenizer",
+            "legacy",
+            "--state",
+            state.to_str().unwrap(),
+        ])
+        .write_stdin("x\n")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("saved with --tokenizer"));
+    std::fs::write(&state, "{not json").unwrap();
+    umami()
+        .args(["pipeline", "--state", state.to_str().unwrap()])
+        .write_stdin("x\n")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("state.json"));
+    std::fs::remove_dir_all(&dir).unwrap();
+}

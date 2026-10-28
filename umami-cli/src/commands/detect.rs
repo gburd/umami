@@ -5,11 +5,17 @@ use clap::Args as ClapArgs;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::io::{self, Write};
-use std::time::{SystemTime, UNIX_EPOCH};
-use umami::{time::event_time, Anomaly, AnomalyKind, Detector, DetectorConfig, Tokenizer};
+use std::path::{Path, PathBuf};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use umami::{
+    time::event_time, Anomaly, AnomalyKind, Detector, DetectorConfig, ProfileStore, Tokenizer,
+};
 
 /// How often, in seconds of event time, to look for silent events and systems.
 const SWEEP_EVERY: i64 = 60;
+
+/// Bump when a change to tokenizing or hashing makes saved profiles invalid.
+const STATE_FORMAT: u64 = 1;
 
 /// Options shared by `pipeline`, `sim` and `ingest`.
 #[derive(ClapArgs)]
@@ -30,6 +36,11 @@ pub struct Args {
     /// Also report parameter changes (new values on known structures).
     #[arg(long)]
     parameters: bool,
+
+    /// Load learned profiles from FILE if it exists, and save them back at
+    /// the end of input (and every minute or so while input is idle).
+    #[arg(long, value_name = "FILE")]
+    state: Option<PathBuf>,
 }
 
 /// `pipeline` options.
@@ -80,7 +91,12 @@ pub fn run(args: Args, format: Format) -> Result<(), Box<dyn Error>> {
     let mut cfg = DetectorConfig::default();
     cfg.tokenizer = args.tokenizer;
     cfg.detect_parameter_changes = args.parameters;
-    let mut det = Detector::with_config(cfg);
+    let store = match &args.state {
+        Some(path) if path.exists() => load_state(path, cfg.tokenizer)?,
+        _ => ProfileStore::new(),
+    };
+    let mut det = Detector::with_store(cfg, store);
+    let mut saved_at = Instant::now();
 
     let mut out = io::BufWriter::new(io::stdout().lock());
     let mut counts: BTreeMap<&'static str, u64> = BTreeMap::new();
@@ -128,9 +144,19 @@ pub fn run(args: Args, format: Format) -> Result<(), Box<dyn Error>> {
         }
         if !more {
             out.flush()?;
+            if let Some(path) = &args.state {
+                if saved_at.elapsed().as_secs() >= 60 {
+                    save_state(path, &det)?;
+                    saved_at = Instant::now();
+                }
+            }
         }
         Ok(())
     })?;
+
+    if let Some(path) = &args.state {
+        save_state(path, &det)?;
+    }
 
     if let Format::Summary = format {
         writeln!(out, "events:    {events}")?;
@@ -154,6 +180,47 @@ fn wall_clock() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
+}
+
+fn load_state(path: &Path, tokenizer: Tokenizer) -> Result<ProfileStore, Box<dyn Error>> {
+    let fail = |why: String| format!("{}: {why}", path.display());
+    let mut v: serde_json::Value =
+        serde_json::from_reader(io::BufReader::new(std::fs::File::open(path)?))
+            .map_err(|e| fail(e.to_string()))?;
+    if v["format"] != STATE_FORMAT {
+        return Err(fail(format!(
+            "state format {} is not {STATE_FORMAT}",
+            v["format"]
+        ))
+        .into());
+    }
+    if v["tokenizer"] != tokenizer.name() {
+        let msg = format!(
+            "saved with --tokenizer {}, not {}",
+            v["tokenizer"],
+            tokenizer.name()
+        );
+        return Err(fail(msg).into());
+    }
+    Ok(serde_json::from_value(v["store"].take()).map_err(|e| fail(e.to_string()))?)
+}
+
+/// Writes the state next to `path` and renames it into place, so a crash
+/// mid-write never leaves a truncated file.
+fn save_state(path: &Path, det: &Detector) -> io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    let mut w = io::BufWriter::new(std::fs::File::create(&tmp)?);
+    serde_json::to_writer(
+        &mut w,
+        &serde_json::json!({
+            "format": STATE_FORMAT,
+            "tokenizer": det.config().tokenizer.name(),
+            "store": det.store(),
+        }),
+    )?;
+    w.into_inner()?.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 fn print(out: &mut impl Write, format: Format, a: &Anomaly) -> io::Result<()> {
