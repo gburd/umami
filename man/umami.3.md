@@ -135,6 +135,7 @@ impl Detector {
         tokens: &[Token], now: i64) -> Option<Anomaly>;
     pub fn sweep(&mut self, now: i64) -> Vec<Anomaly>;
     pub fn config(&self) -> &DetectorConfig;
+    pub fn clock(&self) -> Option<i64>;
     pub fn store(&self) -> &ProfileStore;
 }
 
@@ -162,9 +163,15 @@ caller has already tokenized the line).
 more than **stop_factor** mean intervals (**EventStop**) and systems silent for
 more than **away_secs** (**SystemAway**).  Call it periodically (e.g. once per
 minute of event time).  Each silence is reported once, until the structure or
-system is seen again; the output is sorted by system.  A structure is periodic
-once it has at least three intervals whose standard deviation is under half
-their mean.
+system sends a newer line; the output is sorted by system.  A structure is
+periodic once it has at least three intervals whose standard deviation is
+under half their mean.  Each system is judged on its own clock: *now* minus
+how far behind the latest time its last line was when it arrived, so a system
+whose timestamps lag the others' (local time, shipping delay) is not reported
+for the lag.
+
+**clock** returns the latest time passed to **observe** or **sweep** (for a
+detector made with **with_store**, the latest time in the store).
 
 **with_store** resumes from a previously learned **ProfileStore**; with the
 **serde** feature, **ProfileStore** implements **Serialize** and

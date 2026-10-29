@@ -63,7 +63,9 @@ Reported once, until it sends again.
 on \f[I]event time\f[R]: each line is observed at its own timestamp (ISO
 8601, Apache CLF, or syslog; a syslog timestamp\[cq]s year is inferred),
 and a line without one at the latest timestamp seen so far.
-Silences are looked for once per minute of event time.
+Silences are looked for once per minute of event time, and each system
+is judged on its own clock, so with \f[B]\[en]tagged\f[R] a system whose
+timestamps lag the others\[cq] is not reported for the lag.
 Replaying an old log therefore reports the stops and absences it
 contains.
 Input is processed line by line, so these commands work on live streams
@@ -175,9 +177,13 @@ receives a previously\-unseen parameter value.
 Load learned profiles from \f[I]FILE\f[R] if it exists, and save them
 back at the end of input and at most once a minute while input is idle,
 so learning carries over between runs.
-The file is replaced atomically.
+The file is replaced atomically (via \f[I]FILE\f[R]\f[B].tmp\f[R]), and
+is created before input is read, so an unwritable path fails at once.
 A file saved with a different \f[B]\[en]tokenizer\f[R], or by an
 incompatible version, is an error.
+A state learned from timestamped input resumes its clock, so a
+replay\[cq]s untimed first line is not judged against the wall clock;
+one learned from untimed input keeps using the wall clock.
 .SS Pipeline options
 .TP
 \f[B]\[en]show\-all\f[R]

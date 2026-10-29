@@ -57,7 +57,9 @@ Anomaly kinds:
 **pipeline**, **sim** and **ingest** run the detector on *event time*: each
 line is observed at its own timestamp (ISO 8601, Apache CLF, or syslog; a
 syslog timestamp's year is inferred), and a line without one at the latest
-timestamp seen so far. Silences are looked for once per minute of event time.
+timestamp seen so far. Silences are looked for once per minute of event time,
+and each system is judged on its own clock, so with **--tagged** a system
+whose timestamps lag the others' is not reported for the lag.
 Replaying an old log therefore reports the stops and absences it contains.
 Input is processed line by line, so these commands work on live streams
 (**tail -f**, **journalctl -f**); invalid UTF-8 is replaced, not fatal.
@@ -160,9 +162,13 @@ These apply to **pipeline**, **sim** and **ingest**.
 **--state** *FILE*
 :   Load learned profiles from *FILE* if it exists, and save them back at the
     end of input and at most once a minute while input is idle, so learning
-    carries over between runs. The file is replaced atomically. A file saved
-    with a different **--tokenizer**, or by an incompatible version, is an
-    error.
+    carries over between runs. The file is replaced atomically (via
+    *FILE***.tmp**), and is created before input is read, so an unwritable
+    path fails at once. A file saved with a different **--tokenizer**, or by
+    an incompatible version, is an error. A state learned from timestamped
+    input resumes its clock, so a replay's untimed first line is not judged
+    against the wall clock; one learned from untimed input keeps using the
+    wall clock.
 
 ### Pipeline options
 
