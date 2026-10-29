@@ -260,3 +260,118 @@ fn a_date_in_the_message_does_not_move_the_clock() {
         .success()
         .stdout(predicate::str::contains("event_stop"));
 }
+
+fn scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("umami-cli-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn syslog_across_new_year_keeps_the_clock_moving() {
+    let mut input = String::new();
+    for m in 50..60 {
+        input += &format!("Dec 31 23:{m}:00 h cron: tick\n");
+    }
+    for m in 0..11 {
+        input += &format!("Jan  1 00:{m:02}:00 h cron: tick\n");
+    }
+    input += "Jan  1 00:40:00 h kernel: disk error\n";
+    umami()
+        .arg("pipeline")
+        .write_stdin(input)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("event_stop"))
+        .stdout(predicate::str::contains("system_away"));
+}
+
+#[test]
+fn state_path_ending_in_tmp_is_still_written_atomically() {
+    let dir = scratch("tmp-ext");
+    let state = dir.join("s.tmp");
+    umami()
+        .args(["pipeline", "--state", state.to_str().unwrap()])
+        .write_stdin("hello\n")
+        .assert()
+        .success();
+    assert!(state.exists());
+    assert!(!dir.join("s.tmp.tmp").exists());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn unwritable_state_fails_before_reading_input() {
+    let dir = scratch("nodir");
+    let state = dir.join("missing").join("s.json");
+    umami()
+        .args(["pipeline", "--state", state.to_str().unwrap()])
+        .write_stdin("hello\n")
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr(predicate::str::contains("missing/s.json"));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn state_is_saved_when_the_output_pipe_closes() {
+    let dir = scratch("pipe");
+    let state = dir.join("s.json");
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("umami"))
+        .args(["pipeline", "--state", state.to_str().unwrap()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take()); // the reader goes away, as with `| head -0`
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().unwrap();
+        for i in 0..20_000 {
+            if writeln!(stdin, "word{} {}", "x".repeat(i % 7), "y".repeat(i % 11)).is_err() {
+                break;
+            }
+        }
+    }
+    assert!(child.wait().unwrap().success());
+    let saved = std::fs::read_to_string(&state).unwrap();
+    assert!(saved.contains("\"tokenizer\":\"structure\""));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn resuming_with_an_untimed_first_line_does_not_report_everything_away() {
+    let dir = scratch("resume");
+    let state = dir.join("s.json");
+    let run = |input: String| {
+        let out = umami()
+            .args(["pipeline", "--tagged", "--state", state.to_str().unwrap()])
+            .write_stdin(input)
+            .assert()
+            .success();
+        String::from_utf8(out.get_output().stdout.clone()).unwrap()
+    };
+    let mut day1 = String::new();
+    for m in 0..30 {
+        day1 += &format!("a\t2020-01-01 10:{m:02}:00 tick\nb\t2020-01-01 10:{m:02}:00 tock\n");
+    }
+    run(day1);
+    let resumed = run("a\treplay header\na\t2020-01-01 10:31:00 tick\n".to_string());
+    assert!(!resumed.contains("system_away"), "{resumed}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn sim_counts_sweep_anomalies() {
+    let input = format!("{}2020-01-01 10:30:00 disk error\n", heartbeats(0..10));
+    umami()
+        .arg("sim")
+        .write_stdin(input)
+        .assert()
+        .success()
+        // 2 lines + event_stop + system_away; 9 of 11 lines filtered
+        .stdout(predicate::str::contains("anomalies: 4\n"))
+        .stdout(predicate::str::contains("reduction: 81.8%"));
+}

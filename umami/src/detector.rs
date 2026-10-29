@@ -21,7 +21,6 @@ use crate::profile::{parameter_values, ProfileStore};
 use crate::signature::{structure_signature, structure_string, StructureHash};
 use crate::token::Token;
 use crate::tokenizer::Tokenizer;
-use std::collections::HashSet;
 
 /// The classification assigned to a processed event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,8 +130,8 @@ impl Default for DetectorConfig {
 pub struct Detector {
     config: DetectorConfig,
     store: ProfileStore,
-    /// Systems already reported as away, until they send again.
-    away: HashSet<String>,
+    /// The latest time passed to `observe` or `sweep`.
+    clock: Option<i64>,
 }
 
 impl Detector {
@@ -152,16 +151,23 @@ impl Detector {
     /// Creates a detector that resumes from previously learned `store` (see
     /// [`Detector::store`] and the `serde` feature).
     pub fn with_store(config: DetectorConfig, store: ProfileStore) -> Self {
-        Self {
-            config,
-            store,
-            ..Self::default()
-        }
+        let clock = store
+            .iter_systems()
+            .flat_map(|(_, profiles)| profiles.values().map(|p| p.last_seen))
+            .max();
+        Self { config, store, clock }
     }
 
     /// The detector's configuration.
     pub fn config(&self) -> &DetectorConfig {
         &self.config
+    }
+
+    /// The latest time passed to [`Detector::observe`] or [`Detector::sweep`]
+    /// (or, for a detector made [with a store](Detector::with_store), the
+    /// latest time in it), if any.
+    pub fn clock(&self) -> Option<i64> {
+        self.clock
     }
 
     /// Access the underlying profile store.
@@ -202,15 +208,25 @@ impl Detector {
         };
 
         let cfg = self.config;
-        self.away.remove(system);
+        let clock = self.clock.map_or(now, |c| c.max(now));
+        self.clock = Some(clock);
+        // A line that is current, not lagging the clock, means the system is
+        // back: re-arm its absence report. A late or lagging line does not.
+        if clock - now <= cfg.away_secs {
+            self.store.away.remove(system);
+        }
         let (profile, _created) = self.store.get_or_insert(system, hash, tokens, now);
         let learned = !profile.is_newish(cfg.learn_threshold);
+        let stop_after = cfg.stop_factor * profile.interval_stats.mean;
 
-        // Update frequency stats from the inter-arrival interval. A gap that
-        // sweep() already reported as a stop is an outage, not the rhythm.
+        // Update frequency stats from the inter-arrival interval. Skip a line
+        // older than the last one (no interval), and a gap that sweep()
+        // reported as a stop (an outage, not the rhythm).
+        let gap = now - profile.last_seen;
+        let outage = profile.stop_reported && gap as f64 > stop_after;
         let mut spike: Option<SpikeMagnitude> = None;
-        if profile.count > 0 && !profile.stop_reported {
-            let interval = (now - profile.last_seen).max(0) as f64;
+        if profile.count > 0 && gap >= 0 && !outage {
+            let interval = gap as f64;
             let z = profile.interval_stats.zscore(interval);
             // A spike = arrivals *faster* than usual => interval well *below*
             // the mean => strongly negative z-score.
@@ -239,8 +255,10 @@ impl Detector {
         }
 
         profile.count += 1;
-        profile.last_seen = now;
-        profile.stop_reported = false;
+        profile.last_seen = profile.last_seen.max(now);
+        if (clock - now) as f64 <= stop_after {
+            profile.stop_reported = false; // current again: re-arm
+        }
 
         let signature = if structural_kind.is_some() {
             structure_string(tokens)
@@ -272,17 +290,24 @@ impl Detector {
     /// Reports systems and periodic events that have gone silent as of `now`,
     /// ordered by system, each system's stopped events before its absence.
     /// Call it regularly (say once a minute of event time); each silence is
-    /// reported once, until the structure or system is seen again.
+    /// reported once, until the structure or system sends a *current* line:
+    /// one no further behind the latest time seen than the threshold it
+    /// broke.
     ///
     /// * An [`AnomalyKind::EventStop`] is reported for a periodic profile
     ///   (see [`crate::Profile::is_periodic`]) silent for more than
     ///   [`DetectorConfig::stop_factor`] times its mean interval.
     /// * An [`AnomalyKind::SystemAway`] is reported for a system whose most
     ///   recent event is more than [`DetectorConfig::away_secs`] old.
+    ///
+    /// Every system is judged against the same `now`: one whose clock runs
+    /// behind the others by more than `away_secs` is reported away, once.
     pub fn sweep(&mut self, now: i64) -> Vec<Anomaly> {
         let cfg = self.config;
+        self.clock = Some(self.clock.map_or(now, |c| c.max(now)));
         let mut out = Vec::new();
-        for (system, profiles) in self.store.iter_systems_mut() {
+        let (systems, away) = self.store.systems_and_away_mut();
+        for (system, profiles) in systems {
             let mut latest = i64::MIN;
             for profile in profiles.values_mut() {
                 latest = latest.max(profile.last_seen);
@@ -302,10 +327,7 @@ impl Detector {
                     });
                 }
             }
-            if latest != i64::MIN
-                && now - latest > cfg.away_secs
-                && self.away.insert(system.clone())
-            {
+            if latest != i64::MIN && now - latest > cfg.away_secs && away.insert(system.clone()) {
                 out.push(Anomaly {
                     system: system.clone(),
                     kind: AnomalyKind::SystemAway,
@@ -447,6 +469,42 @@ mod tests {
     }
 
     #[test]
+    fn a_lagging_system_is_reported_once() {
+        // b's clock runs 15 minutes behind a's, on the shared sweep clock
+        let mut d = Detector::new();
+        let mut found = Vec::new();
+        for m in 0..40 {
+            d.observe("a", "tick", m * 60);
+            d.observe("b", "tock", (m - 15) * 60);
+            found.extend(d.sweep(m * 60).into_iter().map(|x| (x.system, x.kind)));
+        }
+        use AnomalyKind::*;
+        assert_eq!(found, [("b".into(), SystemAway), ("b".into(), EventStop)]);
+    }
+
+    #[test]
+    fn late_lines_do_not_rearm_or_skew_intervals() {
+        let mut d = Detector::new();
+        for i in 0..10 {
+            d.observe("h", "heartbeat ok", i * 60);
+        }
+        assert_eq!(d.sweep(1200).len(), 2); // stop + away
+        d.observe("h", "heartbeat ok", 120); // a straggler from the past
+        assert!(d.sweep(1260).is_empty());
+        let hb = structure_signature(&crate::tokenize("heartbeat ok"));
+        assert_eq!(d.store().get("h", hb).unwrap().interval_stats.count, 9);
+        d.observe("h", "heartbeat ok", 1300); // genuinely back
+        // the 760 s outage is not learned as an interval
+        assert_eq!(d.store().get("h", hb).unwrap().interval_stats.mean, 60.0);
+        assert!(d.sweep(1310).is_empty());
+        for i in 1..5 {
+            d.observe("h", "heartbeat ok", 1300 + i * 60);
+        }
+        // stops again: reported again
+        assert!(d.sweep(2000).iter().any(|a| a.kind == AnomalyKind::EventStop));
+    }
+
+    #[test]
     fn bursty_events_do_not_stop() {
         let mut d = Detector::new();
         for t in [0, 1, 2, 300, 301, 302, 900, 901] {
@@ -492,5 +550,10 @@ mod serde_tests {
                 ("other".into(), SystemAway)
             ]
         );
+        // what was reported is saved too: a resumed detector does not repeat it
+        let json = serde_json::to_string(d.store()).unwrap();
+        let store: ProfileStore = serde_json::from_str(&json).unwrap();
+        let mut d = Detector::with_store(DetectorConfig::default(), store);
+        assert!(d.sweep(2100).is_empty());
     }
 }

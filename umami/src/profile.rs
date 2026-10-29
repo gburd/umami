@@ -186,6 +186,9 @@ pub struct ProfileStore {
     /// Structure hashes ever seen across *all* systems (for "never before
     /// seen" vs "new in system" classification).
     global_hashes: HashSet<StructureHash>,
+    /// Systems [`crate::Detector::sweep`] has reported away, until they send
+    /// a current line.
+    pub(crate) away: HashSet<String>,
 }
 
 impl ProfileStore {
@@ -211,10 +214,14 @@ impl ProfileStore {
         self.systems.iter()
     }
 
-    pub(crate) fn iter_systems_mut(
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn systems_and_away_mut(
         &mut self,
-    ) -> impl Iterator<Item = (&String, &mut HashMap<StructureHash, Profile>)> {
-        self.systems.iter_mut()
+    ) -> (
+        impl Iterator<Item = (&String, &mut HashMap<StructureHash, Profile>)>,
+        &mut HashSet<String>,
+    ) {
+        (self.systems.iter_mut(), &mut self.away)
     }
 
     /// Returns the profile for `hash` on `system`, if present.

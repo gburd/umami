@@ -77,23 +77,26 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<(), Box<dyn Error>> {
 /// Runs a detection subcommand over stdin.
 ///
 /// Each line is observed at its own timestamp (see [`umami::time`]); a line
-/// without one is observed at the latest timestamp seen, or the wall clock
-/// before any. Every [`SWEEP_EVERY`] seconds of that clock the detector is
-/// swept for stopped events and silent systems.
+/// without one is observed at the latest timestamp seen (including any in a
+/// loaded `--state`), or the wall clock before any. Every [`SWEEP_EVERY`]
+/// seconds of that clock the detector is swept for stopped events and silent
+/// systems.
 //
 // shortcut: sweeps only run when a line arrives, so a stream that goes fully
 // idle reports system_away when it resumes, not while idle. Read stdin on a
 // thread and sweep on a timer if live idle alerts are needed.
-// shortcut: when replaying old logs, lines before the first timestamp are
-// stamped with the wall clock, which hides system_away for that system for
-// the rest of the replay. Buffer them until the first timestamp if it matters.
 pub fn run(args: Args, format: Format) -> Result<(), Box<dyn Error>> {
     let mut cfg = DetectorConfig::default();
     cfg.tokenizer = args.tokenizer;
     cfg.detect_parameter_changes = args.parameters;
     let store = match &args.state {
         Some(path) if path.exists() => load_state(path, cfg.tokenizer)?,
-        _ => ProfileStore::new(),
+        Some(path) => {
+            // fail now, not after the whole stream
+            save_state(path, &Detector::with_config(cfg))?;
+            ProfileStore::new()
+        }
+        None => ProfileStore::new(),
     };
     let mut det = Detector::with_store(cfg, store);
     let mut saved_at = Instant::now();
@@ -101,10 +104,10 @@ pub fn run(args: Args, format: Format) -> Result<(), Box<dyn Error>> {
     let mut out = io::BufWriter::new(io::stdout().lock());
     let mut counts: BTreeMap<&'static str, u64> = BTreeMap::new();
     let (mut events, mut flagged) = (0u64, 0u64);
-    let mut clock: Option<i64> = None;
+    let mut clock: Option<i64> = det.clock();
     let mut next_sweep = i64::MIN;
 
-    super::for_each_line(io::stdin().lock(), |raw, more| {
+    let result = super::for_each_line(io::stdin().lock(), |raw, more| {
         let (system, line) = match raw.split_once('\t') {
             Some((s, l)) if args.tagged => (s, l),
             _ => (args.system.as_str(), raw),
@@ -124,6 +127,7 @@ pub fn run(args: Args, format: Format) -> Result<(), Box<dyn Error>> {
 
         if latest >= next_sweep {
             for a in det.sweep(latest) {
+                flagged += 1;
                 *counts.entry(a.kind.as_str()).or_default() += 1;
                 print(&mut out, format, &a)?;
             }
@@ -152,17 +156,22 @@ pub fn run(args: Args, format: Format) -> Result<(), Box<dyn Error>> {
             }
         }
         Ok(())
-    })?;
+    });
 
+    // Save even when output failed (`| head` closing the pipe), so learning
+    // is not lost; then report the output error.
     if let Some(path) = &args.state {
         save_state(path, &det)?;
     }
+    result?;
 
     if let Format::Summary = format {
         writeln!(out, "events:    {events}")?;
         writeln!(out, "anomalies: {flagged}")?;
+        // sweep anomalies have no line, so they do not count against lines
+        let flagged_lines = flagged - counts_of_sweeps(&counts);
         let reduction = if events > 0 {
-            100.0 * (1.0 - flagged as f64 / events as f64)
+            100.0 * (1.0 - flagged_lines as f64 / events as f64)
         } else {
             0.0
         };
@@ -182,11 +191,20 @@ fn wall_clock() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+fn counts_of_sweeps(counts: &BTreeMap<&'static str, u64>) -> u64 {
+    [AnomalyKind::EventStop, AnomalyKind::SystemAway]
+        .iter()
+        .map(|k| counts.get(k.as_str()).copied().unwrap_or(0))
+        .sum()
+}
+
 fn load_state(path: &Path, tokenizer: Tokenizer) -> Result<ProfileStore, Box<dyn Error>> {
     let fail = |why: String| format!("{}: {why}", path.display());
-    let mut v: serde_json::Value =
-        serde_json::from_reader(io::BufReader::new(std::fs::File::open(path)?))
-            .map_err(|e| fail(e.to_string()))?;
+    let mut v: serde_json::Value = std::fs::File::open(path)
+        .map_err(|e| fail(e.to_string()))
+        .and_then(|f| {
+            serde_json::from_reader(io::BufReader::new(f)).map_err(|e| fail(e.to_string()))
+        })?;
     if v["format"] != STATE_FORMAT {
         return Err(fail(format!(
             "state format {} is not {STATE_FORMAT}",
@@ -205,22 +223,26 @@ fn load_state(path: &Path, tokenizer: Tokenizer) -> Result<ProfileStore, Box<dyn
     Ok(serde_json::from_value(v["store"].take()).map_err(|e| fail(e.to_string()))?)
 }
 
-/// Writes the state next to `path` and renames it into place, so a crash
-/// mid-write never leaves a truncated file.
+/// Writes the state to `<path>.tmp` and renames it into place, so a crash
+/// mid-write never leaves a truncated file. Errors name the path.
 fn save_state(path: &Path, det: &Detector) -> io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    let mut w = io::BufWriter::new(std::fs::File::create(&tmp)?);
-    serde_json::to_writer(
-        &mut w,
-        &serde_json::json!({
-            "format": STATE_FORMAT,
-            "tokenizer": det.config().tokenizer.name(),
-            "store": det.store(),
-        }),
-    )?;
-    w.into_inner()?.sync_all()?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let write = || -> io::Result<()> {
+        let mut w = io::BufWriter::new(std::fs::File::create(&tmp)?);
+        serde_json::to_writer(
+            &mut w,
+            &serde_json::json!({
+                "format": STATE_FORMAT,
+                "tokenizer": det.config().tokenizer.name(),
+                "store": det.store(),
+            }),
+        )?;
+        w.into_inner()?.sync_all()?;
+        std::fs::rename(&tmp, path)
+    };
+    write().map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))
 }
 
 fn print(out: &mut impl Write, format: Format, a: &Anomaly) -> io::Result<()> {

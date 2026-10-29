@@ -39,7 +39,10 @@ pub const HEADER_TOKENS: usize = 4;
 /// * Syslog: `[Wkd ]Mon DD HH:MM:SS[ YYYY]`
 ///
 /// A form without a zone is read as UTC. A syslog timestamp without a year is
-/// placed in the latest year that does not put it more than a day after `now`.
+/// placed in the year (the year of `now`, or the one before or after) that
+/// puts it closest to `now`, so a stream read across New Year keeps moving
+/// forward. Impossible dates (`Feb 30`) are rejected. `now` is clamped to
+/// years 0..=9999.
 //
 // shortcut: zone-less (local time) stamps are read as UTC, so they are offset
 // from wall-clock time by the local zone; fine for intervals, wrong for
@@ -101,13 +104,25 @@ fn zone(s: &str) -> Option<i64> {
     Some(sign * (h * 3600 + m * 60))
 }
 
-/// Unix seconds for a civil UTC date and seconds into that day.
+/// Unix seconds for a civil UTC date and seconds into that day, or `None`
+/// for a date that does not exist.
 fn unix(year: i64, month: i64, day: i64, secs: i64) -> Option<i64> {
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        1..=12 => 31,
+        _ => return None,
+    };
+    if !(1..=days_in_month).contains(&day) {
         return None;
     }
     Some(days_from_civil(year, month, day) * 86_400 + secs)
 }
+
+/// Unix time range of years 0..=9999, which `now` is clamped to.
+const NOW_RANGE: std::ops::RangeInclusive<i64> = -62_167_219_200..=253_402_300_799;
 
 /// Days since 1970-01-01 (Howard Hinnant's `days_from_civil`).
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
@@ -188,13 +203,11 @@ fn parse_syslog(s: &str, now: i64) -> Option<i64> {
     if !tail.is_empty() {
         return unix(digits(tail, 0, 4)?, mon, day, secs);
     }
+    let now = now.clamp(*NOW_RANGE.start(), *NOW_RANGE.end());
     let year = year_of(now);
-    let t = unix(year, mon, day, secs)?;
-    if t > now + 86_400 {
-        unix(year - 1, mon, day, secs)
-    } else {
-        Some(t)
-    }
+    (year - 1..=year + 1)
+        .filter_map(|y| unix(y, mon, day, secs))
+        .min_by_key(|t| (t - now).abs())
 }
 
 #[cfg(test)]
@@ -231,6 +244,8 @@ mod tests {
         );
         assert_eq!(parse_timestamp("1969-07-20 20:17:40", 0), Some(-14_182_940));
         assert_eq!(parse_timestamp("2020-13-12T15:45:54", 0), None);
+        assert_eq!(parse_timestamp("2021-02-29 00:00:00", 0), None);
+        assert_eq!(parse_timestamp("2021-04-31 00:00:00", 0), None);
         assert_eq!(parse_timestamp("2020-11-12T25:45:54", 0), None);
     }
 
@@ -264,6 +279,21 @@ mod tests {
             parse_timestamp("Dec 31 23:59:59", 1_609_459_210),
             Some(1_609_459_199)
         );
+        // January, read in late December (the clock is the previous line's
+        // time): next year
+        assert_eq!(
+            parse_timestamp("Jan  1 00:00:10", 1_609_459_199),
+            Some(1_609_459_210)
+        );
+        // Feb 29 only exists in leap years; read in 2021 it is 2020's
+        assert_eq!(
+            parse_timestamp("Feb 29 12:00:00", 1_617_235_200),
+            Some(1_582_977_600)
+        );
+        // extreme `now` does not overflow
+        for now in [i64::MIN, i64::MAX] {
+            assert!(parse_timestamp("Jan 23 10:23:45", now).is_some());
+        }
         // explicit year wins
         assert_eq!(
             parse_timestamp("Jan 23 10:23:45 2020", 0),

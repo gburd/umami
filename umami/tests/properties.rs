@@ -110,7 +110,7 @@ proptest! {
     /// The timestamp parser never panics, on any input.
     #[test]
     fn parse_timestamp_never_panics(s in "\\PC{0,40}", now in proptest::num::i64::ANY) {
-        let _ = umami::time::parse_timestamp(&s, now.clamp(-1 << 40, 1 << 40));
+        let _ = umami::time::parse_timestamp(&s, now);
     }
 
     /// Any ISO timestamp the tokenizer finds parses, to the value of its
