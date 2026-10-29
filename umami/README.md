@@ -9,15 +9,18 @@ anomalous* lines, filtering out the bulk of repetitive, already-seen logs.
 1. **Tokenization** — each log line is split into a sequence of typed tokens
    (literals, delimiters, numbers, timestamps, quoted strings, JSON keys, …).
    See [`tokenizer`].
-2. **Structure signature** — the *static* tokens are hashed into a stable
-   [`StructureHash`], so that lines differing only in their dynamic parts
-   (numbers, timestamps, IPs) collapse to the same structure. See [`signature`].
+2. **Structure signature** — the *static* tokens, plus a placeholder for each
+   parameter, are hashed into a stable [`StructureHash`], so that lines
+   differing only in their dynamic parts (numbers, timestamps, IPs, words with
+   a digit or `/` in them) collapse to the same structure. See [`signature`].
 3. **Profiles** — each structure is tracked per system in a [`Profile`] that
    records counts, first/last seen times, per-parameter distinct values and
    inter-arrival statistics. See [`profile`].
 4. **Detection** — incoming events are classified as *never before seen*,
-   *new in system*, *parameter change*, *frequency spike*, *event stop* or
-   *system away*; everything else is filtered as normal. See [`detector`].
+   *new in system*, *parameter change* or *frequency spike*, and periodic
+   [`Detector::sweep`] calls report *event stop* and *system away*;
+   everything else is filtered as normal. See [`detector`] and, for taking
+   event time from the line, [`time`].
 
 ## Quick start
 
@@ -47,8 +50,13 @@ assert_eq!(tokens[0].ty, TokenType::Timestamp);
 
 ## Crate features
 
-The core library has no required dependencies and forbids `unsafe`. A companion
-binary crate, `umami-cli`, provides a command-line interface.
+The core library has no required dependencies and forbids `unsafe`.
+
+* `serde` (off by default): `Serialize`/`Deserialize` for [`ProfileStore`]
+  and the types in it, to save learned state and resume with
+  [`Detector::with_store`].
+
+A companion binary crate, `umami-cli`, provides a command-line interface.
 
 ## License
 

@@ -19,12 +19,15 @@ The detection pipeline has four stages:
 
 1. **Tokenize** — split each line into typed tokens (literals, delimiters,
    timestamps, IP addresses, quoted strings, numbers, JSON keys).
-2. **Structure signature** — hash the static tokens (literals and keys) with
-   FNV-1a into a stable 64-bit fingerprint. Lines that differ only in dynamic
-   values (numbers, timestamps, IPs) share the same signature.
-3. **Profile** — look up the (system, signature) pair in the in-memory store.
-   Track event counts, first/last seen times, per-position parameter values
-   (up to 100 distinct values), and inter-arrival statistics.
+2. **Structure signature** — hash the static tokens (literals and keys), plus a
+   placeholder for each dynamic value, with FNV-1a into a stable 64-bit
+   fingerprint. Dynamic values are numbers, timestamps, IPs, and any word that
+   contains a digit or a **/** (hostnames like *web01*, ids, paths, URLs).
+   Lines that differ only in dynamic values share the same signature.
+3. **Profile** — look up the (system, signature) pair in the store.
+   Track event counts, first/last seen times, the values seen in each
+   parameter slot (up to 100 distinct values; past that the slot is treated
+   as free-form and ignored), and inter-arrival statistics.
 4. **Classify** — compare the new event against the learned profile and emit an
    anomaly kind, or suppress the event if it matches normal behavior.
 
@@ -44,10 +47,20 @@ Anomaly kinds:
     (graded small, medium, or large by z-score magnitude).
 
 **event_stop**
-:   A periodic structure has gone silent beyond a stop threshold.
+:   A structure that arrives at a steady rate has been silent for more than
+    three of its mean intervals. Reported once, until it is seen again.
 
 **system_away**
-:   A system has stopped sending events entirely.
+:   A system has sent nothing for ten minutes. Reported once, until it sends
+    again.
+
+**pipeline**, **sim** and **ingest** run the detector on *event time*: each
+line is observed at its own timestamp (ISO 8601, Apache CLF, or syslog; a
+syslog timestamp's year is inferred), and a line without one at the latest
+timestamp seen so far. Silences are looked for once per minute of event time.
+Replaying an old log therefore reports the stops and absences it contains.
+Input is processed line by line, so these commands work on live streams
+(**tail -f**, **journalctl -f**); invalid UTF-8 is replaced, not fatal.
 
 # SUBCOMMANDS
 
@@ -78,8 +91,8 @@ are given, lines are read from standard input.
     each dynamic (parameter) token.
     **delimiters** — original line followed by a **\^** marker row marking
     each delimiter.
-    **static** — structural tokens (literals and keys) joined by spaces; the
-    structure-signature text.
+    **static** — the structure signature: structural tokens joined by spaces,
+    with **<\*>** for each parameter.
 
 **--color**
 :   Enable ANSI coloring (only meaningful with **--pretty colors**).
@@ -115,17 +128,27 @@ are given, lines are read from standard input.
 
 ## pipeline
 
-**umami pipeline** [**--system** *NAME*] [**--tokenizer** *NAME*]
-[**--parameters**] [**--show-all**]
+**umami pipeline** [*DETECT OPTIONS*] [**--show-all**]
 
 Read log lines from standard input, run each through the detector, and print
 anomalous lines to standard output. Each output line is prefixed with the anomaly
-kind padded to 18 characters, then the original line.
+kind padded to 18 characters, then the original line. **event_stop** and
+**system_away**, which have no line, print **[***system***]** and the
+signature instead.
 
 Without **--show-all**, normal (non-anomalous) lines are suppressed.
 
+### Detect options
+
+These apply to **pipeline**, **sim** and **ingest**.
+
 **--system** *NAME*
 :   Attribute events to this system name (default: **stdin**).
+
+**--tagged**
+:   Treat each input line as *system*\t*logline*, so several systems can be
+    multiplexed on one stream. Lines without a tab are attributed to
+    **--system**.
 
 **--tokenizer** *structure*|*legacy*
 :   Tokenizer variant (default: **structure**).
@@ -133,6 +156,15 @@ Without **--show-all**, normal (non-anomalous) lines are suppressed.
 **--parameters**
 :   Also emit **parameter_change** anomalies when a known structure receives a
     previously-unseen parameter value.
+
+**--state** *FILE*
+:   Load learned profiles from *FILE* if it exists, and save them back at the
+    end of input and at most once a minute while input is idle, so learning
+    carries over between runs. The file is replaced atomically. A file saved
+    with a different **--tokenizer**, or by an incompatible version, is an
+    error.
+
+### Pipeline options
 
 **--show-all**
 :   Print every line; prefix normal lines with **ok** instead of suppressing them.
@@ -147,57 +179,40 @@ Without **--show-all**, normal (non-anomalous) lines are suppressed.
     # Detect parameter changes too
     cat access.log | umami pipeline --parameters
 
+    # Follow the journal, remembering what was learned last time
+    journalctl -f | umami pipeline --state ~/.cache/umami.json
+
 ## sim
 
-**umami sim** [**--system** *NAME*] [**--tokenizer** *NAME*] [**--parameters**]
+**umami sim** [*DETECT OPTIONS*]
 
 Consume all of standard input and print a summary of anomaly counts, total event
-count, and the noise-reduction percentage (fraction of events filtered as normal).
-
-**--system** *NAME*
-:   System name (default: **stdin**).
-
-**--tokenizer** *structure*|*legacy*
-:   Tokenizer variant (default: **structure**).
-
-**--parameters**
-:   Include parameter-change anomalies in the count.
+count, and the noise-reduction percentage (fraction of lines filtered as
+normal). Takes the detect options described under **pipeline**.
 
 ### Example
 
     cat /var/log/syslog | umami sim --system prod-web01
 
-    events:    10000
-    anomalies: 47
-    reduction: 99.5%
-    profiles:  312
-      never_before_seen  31
-      new_in_system      12
-      parameter_change    4
+    events:    50000
+    anomalies: 222
+    reduction: 99.6%
+    profiles:  210
+      event_stop         9
+      frequency_spike    12
+      never_before_seen  210
 
 ## ingest
 
-**umami ingest** [**--system** *NAME*] [**--tagged**] [**--tokenizer** *NAME*]
-[**--parameters**]
+**umami ingest** [*DETECT OPTIONS*]
 
-Read log lines from standard input and emit one JSON object per anomalous event
-to standard output (newline-delimited JSON).  Each JSON object has the fields:
-**system**, **kind**, **score** (float 0–1), **signature** (structural tokens),
-**line** (original log line).
-
-**--system** *NAME*
-:   Default system name when input is not tagged (default: **stdin**).
-
-**--tagged**
-:   Treat each input line as *system*\t*logline*. This allows multiple systems
-    to be multiplexed on one input stream. Lines without a tab are attributed to
-    **--system**.
-
-**--tokenizer** *structure*|*legacy*
-:   Tokenizer variant (default: **structure**).
-
-**--parameters**
-:   Emit parameter-change events.
+Read log lines from standard input and emit one JSON object per anomaly to
+standard output (newline-delimited JSON).  Each JSON object has the fields:
+**system**, **kind**, **score** (float 0–1), **hash** (the 16-hex-digit
+structure hash, or **null** for **system_away**), **signature** (the
+structure, with **<\*>** for each parameter), **line** (original log line;
+empty for **event_stop** and **system_away**). Takes the detect options
+described under **pipeline**.
 
 ### Examples
 
@@ -208,15 +223,16 @@ to standard output (newline-delimited JSON).  Each JSON object has the fields:
 
     # Example output line
     {"system":"web01","kind":"never_before_seen","score":1.00,
-     "signature":"disk full on","line":"disk full on /dev/sda1"}
+     "hash":"96a870bdc586e53c","signature":"disk full on <*>",
+     "line":"disk full on /dev/sda1"}
 
 ## load
 
 **umami load** [**--count** *N*] [**--tokenizer** *NAME*] [**--stdin**]
 
-Throughput benchmark. By default generates *N* synthetic log lines and measures
-how fast the detector processes them. With **--stdin**, reads from standard input
-instead.
+Throughput benchmark. By default generates *N* synthetic log lines from four
+templates and measures how fast the detector filters them. With **--stdin**,
+reads from standard input instead.
 
 **--count** *N*
 :   Number of synthetic events to generate (default: **1000000**).
@@ -239,7 +255,8 @@ instead.
 :   Success.
 
 **1**
-:   An error occurred (bad argument, I/O error, test failure).
+:   An error occurred (bad argument, I/O error, unreadable **--state** file,
+    test failure). A closed output pipe (**| head**) is not an error.
 
 # FILES
 

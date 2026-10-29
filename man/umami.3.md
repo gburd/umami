@@ -56,11 +56,15 @@ The library forbids unsafe code and has no required runtime dependencies.
 **pretty**
 :   **Pretty** — pretty-printers for debugging and CLI output.
 
+**time**
+:   **parse_timestamp** and **event_time** — turning a timestamp token into
+    unix seconds, so the detector can run on event time.
+
 # TYPES
 
 ## Tokenizer
 
-```rust
+```rust,ignore
 pub enum Tokenizer { Structure, Legacy }
 ```
 
@@ -73,7 +77,7 @@ free function **tokenize(line)** as shorthand for **Tokenizer::Structure**.
 
 ## Token / TokenType
 
-```rust
+```rust,ignore
 pub struct Token { pub ty: TokenType, pub text: String }
 
 pub enum TokenType {
@@ -88,48 +92,64 @@ pub enum TokenType {
 }
 ```
 
-**TokenType::is_structural()** returns **true** for Literal, JsonKey, and Json
-(tokens that contribute to the structure signature).
+**TokenType::is_structural()** returns **true** for Literal, JsonKey, and Json;
+**TokenType::is_parameter()** for Number, Timestamp, Ipv4, and Quoted.
 
-**TokenType::is_parameter()** returns **true** for Number, Timestamp, Ipv4, and
-Quoted (dynamic tokens tracked per profile).
+The detector decides per token, with **Token::is_structural()** and
+**Token::is_parameter()**: these follow the type, except that a Literal
+containing a digit or a **/** (*web01*, an id, a path or URL) is a parameter.
 
 ## structure_signature
 
-```rust
+```rust,ignore
 pub fn structure_signature(tokens: &[Token]) -> StructureHash
 ```
 
-Computes the FNV-1a 64-bit hash of the structural tokens (type + text for each,
-in order, with a separator byte).  Two lines with the same structure but different
-dynamic values produce the same **StructureHash**.
+Computes the FNV-1a 64-bit hash of the structural tokens (type + text for each)
+and of a placeholder for each parameter, in order, with a separator byte.  Two
+lines with the same structure but different dynamic values produce the same
+**StructureHash**; moving a parameter (*foo 1 bar* vs *foo bar 1*) changes it.
 
 ## structure_string
 
-```rust
+```rust,ignore
 pub fn structure_string(tokens: &[Token]) -> String
 ```
 
-Renders the structural tokens as a space-joined string.  This is the
-human-readable form of the signature (the `static` printer output).
+Renders the signature as a space-joined string, with **<\*>** for each
+parameter.  This is the human-readable form of the signature (the `static`
+printer output).
 
 ## Detector
 
-```rust
+```rust,ignore
 pub struct Detector { /* ... */ }
 
 impl Detector {
     pub fn new() -> Self;
     pub fn with_config(config: DetectorConfig) -> Self;
+    pub fn with_store(config: DetectorConfig, store: ProfileStore) -> Self;
     pub fn observe(&mut self, system: &str, line: &str, now: i64)
         -> Option<Anomaly>;
     pub fn observe_tokens(&mut self, system: &str, line: &str,
         tokens: &[Token], now: i64) -> Option<Anomaly>;
-    pub fn sweep(&self, now: i64, stop_factor: f64, away_secs: i64)
-        -> Vec<Anomaly>;
+    pub fn sweep(&mut self, now: i64) -> Vec<Anomaly>;
+    pub fn config(&self) -> &DetectorConfig;
     pub fn store(&self) -> &ProfileStore;
 }
+
+pub struct Anomaly {
+    pub system: String,
+    pub kind: AnomalyKind,
+    pub hash: Option<StructureHash>,  // None for SystemAway
+    pub signature: String,
+    pub line: String,                 // empty for EventStop / SystemAway
+    pub score: f64,
+}
 ```
+
+*now* is unix seconds of event time; see **time::event_time** to take it from
+the line itself.
 
 **observe** tokenizes *line*, looks up or creates the per-system profile, updates
 statistics, and returns **Some(Anomaly)** if the event is anomalous.  Returns
@@ -138,12 +158,21 @@ statistics, and returns **Some(Anomaly)** if the event is anomalous.  Returns
 **observe_tokens** is identical but accepts pre-computed tokens (useful when the
 caller has already tokenized the line).
 
-**sweep** scans all profiles for events/systems that have gone silent.  It should
-be called periodically (e.g. once per minute).
+**sweep** reports, as of *now*, periodic structures that have been silent for
+more than **stop_factor** mean intervals (**EventStop**) and systems silent for
+more than **away_secs** (**SystemAway**).  Call it periodically (e.g. once per
+minute of event time).  Each silence is reported once, until the structure or
+system is seen again; the output is sorted by system.  A structure is periodic
+once it has at least three intervals whose standard deviation is under half
+their mean.
+
+**with_store** resumes from a previously learned **ProfileStore**; with the
+**serde** feature, **ProfileStore** implements **Serialize** and
+**Deserialize**.
 
 ## DetectorConfig
 
-```rust
+```rust,ignore
 pub struct DetectorConfig {
     pub tokenizer: Tokenizer,
     pub learn_threshold: u64,
@@ -151,15 +180,22 @@ pub struct DetectorConfig {
     pub spike_medium: f64,
     pub spike_large: f64,
     pub detect_parameter_changes: bool,
+    pub stop_factor: f64,
+    pub away_secs: i64,
 }
 ```
 
 Defaults: structure tokenizer, learn_threshold=1, spike thresholds 3/6/12 (z-score),
-parameter changes disabled.
+parameter changes disabled, stop_factor=3, away_secs=600.  Frequency spikes and
+parameter changes are only reported once a profile has been seen
+**learn_threshold** times.
+
+**DetectorConfig** and **AnomalyKind** are **#[non_exhaustive]**: build a
+config from **DetectorConfig::default()** and assign the fields you need.
 
 ## AnomalyKind
 
-```rust
+```rust,ignore
 pub enum AnomalyKind {
     NeverBeforeSeen,
     NewInSystem,
@@ -192,12 +228,14 @@ deviations *x* is from the current mean.
 
 ## ParamTracker
 
-Tracks distinct values observed at one dynamic parameter position, capped at 100
-entries.  **ParamTracker::observe(value)** returns **true** when the value is new.
+Tracks distinct values observed at one parameter slot (the *n*th parameter of
+the line).  **ParamTracker::observe(value)** returns **true** when the value is
+new.  Past 100 distinct values the slot is *saturated*: treated as free-form
+(an id, a counter), it forgets its values and never reports a change again.
 
 ## Pretty
 
-```rust
+```rust,ignore
 pub enum Pretty { Test, Colors, Params, Delimiters, Static }
 ```
 
@@ -224,11 +262,9 @@ assert!(det.observe("host1", "service restarted", 1).is_none());
 ```rust
 use umami::{Detector, DetectorConfig, Tokenizer};
 
-let cfg = DetectorConfig {
-    tokenizer: Tokenizer::Legacy,
-    detect_parameter_changes: true,
-    ..DetectorConfig::default()
-};
+let mut cfg = DetectorConfig::default();
+cfg.tokenizer = Tokenizer::Legacy;
+cfg.detect_parameter_changes = true;
 let mut det = Detector::with_config(cfg);
 ```
 
@@ -239,10 +275,19 @@ use umami::{tokenize, TokenType};
 
 let toks = tokenize("level=info msg=started host=node01 count=42");
 for t in &toks {
-    if t.ty.is_parameter() {
-        println!("param: {}", t.text);
+    if t.is_parameter() {
+        println!("param: {}", t.text); // node01, 42
     }
 }
+```
+
+## Event time
+
+```rust
+use umami::{time::event_time, tokenize};
+
+let toks = tokenize("2020-11-12T15:45:54+0000 INFO started");
+assert_eq!(event_time(&toks, 0), Some(1_605_195_954));
 ```
 
 ## Structure signature

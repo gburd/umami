@@ -31,3 +31,6 @@ harness = false
 [[bench]]
 name = "detect"
 harness = false
+
+[package.metadata.docs.rs]
+all-features = true
