@@ -89,14 +89,14 @@ pub fn run(args: Args, format: Format) -> Result<(), Box<dyn Error>> {
     let mut cfg = DetectorConfig::default();
     cfg.tokenizer = args.tokenizer;
     cfg.detect_parameter_changes = args.parameters;
-    let store = match &args.state {
+    let (store, event_clock) = match &args.state {
         Some(path) if path.exists() => load_state(path, cfg.tokenizer)?,
         Some(path) => {
             // fail now, not after the whole stream
-            save_state(path, &Detector::with_config(cfg))?;
-            ProfileStore::new()
+            save_state(path, &Detector::with_config(cfg), false)?;
+            (ProfileStore::new(), false)
         }
-        None => ProfileStore::new(),
+        None => (ProfileStore::new(), false),
     };
     let mut det = Detector::with_store(cfg, store);
     let mut saved_at = Instant::now();
@@ -104,7 +104,10 @@ pub fn run(args: Args, format: Format) -> Result<(), Box<dyn Error>> {
     let mut out = io::BufWriter::new(io::stdout().lock());
     let mut counts: BTreeMap<&'static str, u64> = BTreeMap::new();
     let (mut events, mut flagged) = (0u64, 0u64);
-    let mut clock: Option<i64> = det.clock();
+    // A state learned on event time resumes its clock, so a replay's untimed
+    // first line is not stamped "now" against old profiles; one learned on
+    // the wall clock (untimed input) keeps using the wall clock.
+    let mut clock: Option<i64> = det.clock().filter(|_| event_clock);
     let mut next_sweep = i64::MIN;
 
     let result = super::for_each_line(io::stdin().lock(), |raw, more| {
@@ -150,7 +153,7 @@ pub fn run(args: Args, format: Format) -> Result<(), Box<dyn Error>> {
             out.flush()?;
             if let Some(path) = &args.state {
                 if saved_at.elapsed().as_secs() >= 60 {
-                    save_state(path, &det)?;
+                    save_state(path, &det, clock.is_some())?;
                     saved_at = Instant::now();
                 }
             }
@@ -161,7 +164,7 @@ pub fn run(args: Args, format: Format) -> Result<(), Box<dyn Error>> {
     // Save even when output failed (`| head` closing the pipe), so learning
     // is not lost; then report the output error.
     if let Some(path) = &args.state {
-        save_state(path, &det)?;
+        save_state(path, &det, clock.is_some())?;
     }
     result?;
 
@@ -198,7 +201,8 @@ fn counts_of_sweeps(counts: &BTreeMap<&'static str, u64>) -> u64 {
         .sum()
 }
 
-fn load_state(path: &Path, tokenizer: Tokenizer) -> Result<ProfileStore, Box<dyn Error>> {
+/// Loads a state file: the store, and whether its times are event times.
+fn load_state(path: &Path, tokenizer: Tokenizer) -> Result<(ProfileStore, bool), Box<dyn Error>> {
     let fail = |why: String| format!("{}: {why}", path.display());
     let mut v: serde_json::Value = std::fs::File::open(path)
         .map_err(|e| fail(e.to_string()))
@@ -220,12 +224,14 @@ fn load_state(path: &Path, tokenizer: Tokenizer) -> Result<ProfileStore, Box<dyn
         );
         return Err(fail(msg).into());
     }
-    Ok(serde_json::from_value(v["store"].take()).map_err(|e| fail(e.to_string()))?)
+    let event_clock = v["clock"] != "wall";
+    let store = serde_json::from_value(v["store"].take()).map_err(|e| fail(e.to_string()))?;
+    Ok((store, event_clock))
 }
 
 /// Writes the state to `<path>.tmp` and renames it into place, so a crash
 /// mid-write never leaves a truncated file. Errors name the path.
-fn save_state(path: &Path, det: &Detector) -> io::Result<()> {
+fn save_state(path: &Path, det: &Detector, event_clock: bool) -> io::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
@@ -236,6 +242,7 @@ fn save_state(path: &Path, det: &Detector) -> io::Result<()> {
             &serde_json::json!({
                 "format": STATE_FORMAT,
                 "tokenizer": det.config().tokenizer.name(),
+                "clock": if event_clock { "event" } else { "wall" },
                 "store": det.store(),
             }),
         )?;

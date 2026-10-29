@@ -17,7 +17,7 @@
 //! Events that match a learned profile without triggering any of the above are
 //! *not* anomalies and are filtered out.
 
-use crate::profile::{parameter_values, ProfileStore};
+use crate::profile::{parameter_values, ProfileStore, SystemClock};
 use crate::signature::{structure_signature, structure_string, StructureHash};
 use crate::token::Token;
 use crate::tokenizer::Tokenizer;
@@ -214,10 +214,21 @@ impl Detector {
         let cfg = self.config;
         let clock = self.clock.map_or(now, |c| c.max(now));
         self.clock = Some(clock);
-        // A line that is current, not lagging the clock, means the system is
-        // back: re-arm its absence report. A late or lagging line does not.
-        if clock - now <= cfg.away_secs {
-            self.store.away.remove(system);
+        let sys = self
+            .store
+            .clocks
+            .entry(system.to_string())
+            .or_insert(SystemClock {
+                latest: i64::MIN,
+                ..SystemClock::default()
+            });
+        if now > sys.latest {
+            // the system is (still) here: note how far behind it runs, re-arm
+            *sys = SystemClock {
+                latest: now,
+                lag: clock.saturating_sub(now),
+                away: false,
+            };
         }
         let (profile, _created) = self.store.get_or_insert(system, hash, tokens, now);
         let learned = !profile.is_newish(cfg.learn_threshold);
@@ -259,9 +270,9 @@ impl Detector {
         }
 
         profile.count += 1;
-        profile.last_seen = profile.last_seen.max(now);
-        if (clock - now) as f64 <= stop_after {
-            profile.stop_reported = false; // current again: re-arm
+        if now > profile.last_seen {
+            profile.last_seen = now;
+            profile.stop_reported = false; // heard from again: re-arm
         }
 
         let signature = if structural_kind.is_some() {
@@ -294,9 +305,8 @@ impl Detector {
     /// Reports systems and periodic events that have gone silent as of `now`,
     /// ordered by system, each system's stopped events before its absence.
     /// Call it regularly (say once a minute of event time); each silence is
-    /// reported once, until the structure or system sends a *current* line:
-    /// one no further behind the latest time seen than the threshold it
-    /// broke.
+    /// reported once, until the structure or system sends a line newer than
+    /// its last one.
     ///
     /// * An [`AnomalyKind::EventStop`] is reported for a periodic profile
     ///   (see [`crate::Profile::is_periodic`]) silent for more than
@@ -304,18 +314,27 @@ impl Detector {
     /// * An [`AnomalyKind::SystemAway`] is reported for a system whose most
     ///   recent event is more than [`DetectorConfig::away_secs`] old.
     ///
-    /// Every system is judged against the same `now`: one whose clock runs
-    /// behind the others by more than `away_secs` is reported away, once.
+    /// Each system is judged on its own clock: `now` minus how far behind
+    /// `now` its latest line was when it arrived. So a system whose
+    /// timestamps lag the others' (zone-less local time, shipping delay) is
+    /// not reported for the lag, and is still reported when it goes quiet.
     pub fn sweep(&mut self, now: i64) -> Vec<Anomaly> {
         let cfg = self.config;
         self.clock = Some(self.clock.map_or(now, |c| c.max(now)));
         let mut out = Vec::new();
-        let (systems, away) = self.store.systems_and_away_mut();
+        let (systems, clocks) = self.store.systems_and_clocks_mut();
         for (system, profiles) in systems {
-            let mut latest = i64::MIN;
+            let sys = clocks.entry(system.clone()).or_insert_with(|| SystemClock {
+                latest: profiles
+                    .values()
+                    .map(|p| p.last_seen)
+                    .max()
+                    .unwrap_or(i64::MIN),
+                ..SystemClock::default()
+            });
+            let now = now.saturating_sub(sys.lag);
             for profile in profiles.values_mut() {
-                latest = latest.max(profile.last_seen);
-                let silent = (now - profile.last_seen) as f64;
+                let silent = now.saturating_sub(profile.last_seen) as f64;
                 if !profile.stop_reported
                     && profile.is_periodic()
                     && silent > cfg.stop_factor * profile.interval_stats.mean
@@ -331,7 +350,9 @@ impl Detector {
                     });
                 }
             }
-            if latest != i64::MIN && now - latest > cfg.away_secs && away.insert(system.clone()) {
+            if !sys.away && sys.latest != i64::MIN && now.saturating_sub(sys.latest) > cfg.away_secs
+            {
+                sys.away = true;
                 out.push(Anomaly {
                     system: system.clone(),
                     kind: AnomalyKind::SystemAway,
@@ -472,18 +493,62 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_lagging_system_is_reported_once() {
-        // b's clock runs 15 minutes behind a's, on the shared sweep clock
+    /// Two systems on `period`-second rhythms, `b` running `lag` seconds
+    /// behind `a`, swept every 60 s; `b` stops at `b_stops` (minutes).
+    fn lagging(period: i64, lag: i64, b_stops: i64) -> Vec<(String, AnomalyKind)> {
         let mut d = Detector::new();
         let mut found = Vec::new();
-        for m in 0..40 {
-            d.observe("a", "tick", m * 60);
-            d.observe("b", "tock", (m - 15) * 60);
-            found.extend(d.sweep(m * 60).into_iter().map(|x| (x.system, x.kind)));
+        let mut next_sweep = 0;
+        for t in (0..3600).step_by(period as usize) {
+            d.observe("a", "tick", t);
+            if t < b_stops * 60 {
+                d.observe("b", "tock", t - lag);
+            }
+            if t >= next_sweep {
+                found.extend(d.sweep(t).into_iter().map(|x| (x.system, x.kind)));
+                next_sweep = t + 60;
+            }
         }
+        found
+    }
+
+    #[test]
+    fn a_lagging_system_is_judged_on_its_own_clock() {
         use AnomalyKind::*;
-        assert_eq!(found, [("b".into(), SystemAway), ("b".into(), EventStop)]);
+        for (period, lag) in [(60, 150), (60, 590), (60, 900), (5, 12), (5, 3000)] {
+            assert_eq!(lagging(period, lag, 60), [], "period {period} lag {lag}");
+            // and when it really stops, that is reported, once each
+            let b = |v: Vec<(String, AnomalyKind)>| {
+                v.into_iter()
+                    .filter(|x| x.0 == "b")
+                    .map(|x| x.1)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                b(lagging(period, lag, 30)),
+                [EventStop, SystemAway],
+                "period {period} lag {lag}"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_callers_work_system_by_system() {
+        // all of a's day, then all of b's: b's lines are all "late"
+        let mut d = Detector::new();
+        for t in (0..3600).step_by(60) {
+            d.observe("a", "tick", t);
+        }
+        for t in (0..1800).step_by(60) {
+            d.observe("b", "tock", t);
+        }
+        let found: Vec<_> = d
+            .sweep(3600)
+            .into_iter()
+            .map(|a| (a.system, a.kind))
+            .collect();
+        // b is judged at its own 1740 + lag-free time: not away, not stopped
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]

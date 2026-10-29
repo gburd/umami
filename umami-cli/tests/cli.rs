@@ -375,3 +375,35 @@ fn sim_counts_sweep_anomalies() {
         .stdout(predicate::str::contains("anomalies: 4\n"))
         .stdout(predicate::str::contains("reduction: 81.8%"));
 }
+
+#[test]
+fn untimed_input_keeps_the_wall_clock_across_runs() {
+    let dir = scratch("untimed");
+    let state = dir.join("s.json");
+    let run = || {
+        umami()
+            .args(["pipeline", "--state", state.to_str().unwrap()])
+            .write_stdin("plain line\n")
+            .assert()
+            .success();
+    };
+    run();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    run();
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+    assert_eq!(v["clock"], "wall");
+    let profile = v["store"]["systems"]["stdin"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    // the second run was stamped with the wall clock, not the saved time
+    assert!(
+        profile["interval_stats"]["mean"].as_f64().unwrap() >= 1.0,
+        "{profile}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}

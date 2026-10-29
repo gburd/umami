@@ -186,9 +186,23 @@ pub struct ProfileStore {
     /// Structure hashes ever seen across *all* systems (for "never before
     /// seen" vs "new in system" classification).
     global_hashes: HashSet<StructureHash>,
-    /// Systems [`crate::Detector::sweep`] has reported away, until they send
-    /// a current line.
-    pub(crate) away: HashSet<String>,
+    /// Per-system clock bookkeeping for [`crate::Detector::sweep`].
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) clocks: HashMap<String, SystemClock>,
+}
+
+/// How one system's time relates to the detector's, so each system can be
+/// judged on its own clock.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub(crate) struct SystemClock {
+    /// The system's latest event time.
+    pub(crate) latest: i64,
+    /// How far behind the detector's clock that event was when it arrived
+    /// (zone-less local time, shipping delay).
+    pub(crate) lag: i64,
+    /// Whether the system has been reported away since `latest`.
+    pub(crate) away: bool,
 }
 
 impl ProfileStore {
@@ -215,13 +229,13 @@ impl ProfileStore {
     }
 
     #[allow(clippy::type_complexity)]
-    pub(crate) fn systems_and_away_mut(
+    pub(crate) fn systems_and_clocks_mut(
         &mut self,
     ) -> (
         impl Iterator<Item = (&String, &mut HashMap<StructureHash, Profile>)>,
-        &mut HashSet<String>,
+        &mut HashMap<String, SystemClock>,
     ) {
-        (self.systems.iter_mut(), &mut self.away)
+        (self.systems.iter_mut(), &mut self.clocks)
     }
 
     /// Returns the profile for `hash` on `system`, if present.

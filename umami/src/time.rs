@@ -39,9 +39,10 @@ pub const HEADER_TOKENS: usize = 4;
 /// * Syslog: `[Wkd ]Mon DD HH:MM:SS[ YYYY]`
 ///
 /// A form without a zone is read as UTC. A syslog timestamp without a year is
-/// placed in the year (the year of `now`, or the one before or after) that
-/// puts it closest to `now`, so a stream read across New Year keeps moving
-/// forward. Impossible dates (`Feb 30`) are rejected. `now` is clamped to
+/// placed in the latest year (of the year of `now` and the ones either side)
+/// that does not put it more than a day after `now`: `Jan 1` read on Dec 31
+/// is next year's, and `Mar 1` read in October is this year's, never a
+/// future one. Impossible dates (`Feb 30`) are rejected. `now` is clamped to
 /// years 0..=9999.
 //
 // shortcut: zone-less (local time) stamps are read as UTC, so they are offset
@@ -207,7 +208,8 @@ fn parse_syslog(s: &str, now: i64) -> Option<i64> {
     let year = year_of(now);
     (year - 1..=year + 1)
         .filter_map(|y| unix(y, mon, day, secs))
-        .min_by_key(|t| (t - now).abs())
+        .filter(|&t| t <= now + 86_400)
+        .max()
 }
 
 #[cfg(test)]
@@ -284,6 +286,12 @@ mod tests {
         assert_eq!(
             parse_timestamp("Jan  1 00:00:10", 1_609_459_199),
             Some(1_609_459_210)
+        );
+        // a month long past is this year's, not next year's (replaying an
+        // old log while the clock is still the wall clock)
+        assert_eq!(
+            parse_timestamp("Mar  1 00:00:00", 1_793_232_000), // 2026-10-29
+            Some(1_772_323_200)                                // 2026-03-01
         );
         // Feb 29 only exists in leap years; read in 2021 it is 2020's
         assert_eq!(
