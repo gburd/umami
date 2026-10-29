@@ -243,3 +243,20 @@ fn state_file_carries_learning_across_runs() {
         .stderr(predicate::str::contains("state.json"));
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn a_date_in_the_message_does_not_move_the_clock() {
+    // Before the fix the 2099 date became "now" and the real stop at 10:10
+    // was never reported.
+    let input = format!(
+        "{}cert for host expires 2099-01-01 00:00:00 renew soon\n{}2020-01-01 10:30:00 boom\n",
+        heartbeats(0..6),
+        heartbeats(6..10)
+    );
+    umami()
+        .arg("pipeline")
+        .write_stdin(input)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("event_stop"));
+}

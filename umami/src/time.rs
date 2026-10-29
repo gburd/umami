@@ -12,13 +12,24 @@
 use crate::token::{Token, TokenType};
 use crate::tokenizer::MONTHS;
 
-/// Returns the unix time of the first timestamp token in `tokens`, if it
-/// parses. `now` (unix seconds) only picks the year for forms that have none;
-/// see [`parse_timestamp`].
+/// Returns the unix time of the line's header timestamp, if it has one and it
+/// parses: the first timestamp token among the first
+/// [`HEADER_TOKENS`] non-delimiter tokens. That covers a leading stamp and
+/// formats with a short prefix (Apache's `ip - - [date]`), while a date in
+/// the message body (`... cert expires 2099-01-01 ...`) is not taken as the
+/// event time. `now` (unix seconds) only picks the year for forms that have
+/// none; see [`parse_timestamp`].
 pub fn event_time(tokens: &[Token], now: i64) -> Option<i64> {
-    let t = tokens.iter().find(|t| t.ty == TokenType::Timestamp)?;
+    let t = tokens
+        .iter()
+        .filter(|t| t.ty != TokenType::Delimiter)
+        .take(HEADER_TOKENS)
+        .find(|t| t.ty == TokenType::Timestamp)?;
     parse_timestamp(&t.text, now)
 }
+
+/// How many leading non-delimiter tokens [`event_time`] searches.
+pub const HEADER_TOKENS: usize = 4;
 
 /// Parses a timestamp in one of the forms the tokenizers recognise into unix
 /// seconds:
@@ -266,6 +277,14 @@ mod tests {
         assert_eq!(year_of(1_609_459_200), 2021);
         assert_eq!(year_of(-1), 1969);
         assert_eq!(year_of(1_709_208_000), 2024);
+    }
+
+    #[test]
+    fn only_a_header_timestamp_is_the_event_time() {
+        let at = |s| event_time(&Tokenizer::Structure.tokenize(s), 0);
+        assert_eq!(at("[2020-11-12 15:45:54] x"), Some(1_605_195_954));
+        assert_eq!(at("cert for host expires 2099-01-01 00:00:00 renew"), None);
+        assert_eq!(at(""), None);
     }
 
     #[test]
