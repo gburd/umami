@@ -155,7 +155,11 @@ impl Detector {
             .iter_systems()
             .flat_map(|(_, profiles)| profiles.values().map(|p| p.last_seen))
             .max();
-        Self { config, store, clock }
+        Self {
+            config,
+            store,
+            clock,
+        }
     }
 
     /// The detector's configuration.
@@ -493,15 +497,18 @@ mod tests {
         assert!(d.sweep(1260).is_empty());
         let hb = structure_signature(&crate::tokenize("heartbeat ok"));
         assert_eq!(d.store().get("h", hb).unwrap().interval_stats.count, 9);
-        d.observe("h", "heartbeat ok", 1300); // genuinely back
-        // the 760 s outage is not learned as an interval
+        // genuinely back; the 760 s outage is not learned as an interval
+        d.observe("h", "heartbeat ok", 1300);
         assert_eq!(d.store().get("h", hb).unwrap().interval_stats.mean, 60.0);
         assert!(d.sweep(1310).is_empty());
         for i in 1..5 {
             d.observe("h", "heartbeat ok", 1300 + i * 60);
         }
         // stops again: reported again
-        assert!(d.sweep(2000).iter().any(|a| a.kind == AnomalyKind::EventStop));
+        assert!(d
+            .sweep(2000)
+            .iter()
+            .any(|a| a.kind == AnomalyKind::EventStop));
     }
 
     #[test]
