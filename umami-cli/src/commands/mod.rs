@@ -31,7 +31,7 @@ pub(crate) fn for_each_line(
 
 /// Parses `--tokenizer`, listing the choices in `--help` and errors.
 pub(crate) fn tokenizer_arg() -> impl TypedValueParser<Value = Tokenizer> {
-    PossibleValuesParser::new(["structure", "legacy"]).map(|s| Tokenizer::from_name(&s).unwrap())
+    PossibleValuesParser::new(["structure"]).map(|s| Tokenizer::from_name(&s).unwrap())
 }
 
 /// Parses `--pretty`, listing the choices in `--help` and errors.

@@ -13,21 +13,18 @@ fn line_strategy() -> impl Strategy<Value = String> {
 }
 
 proptest! {
+    #![proptest_config(ProptestConfig {
+        failure_persistence: Some(Box::new(
+            proptest::test_runner::FileFailurePersistence::WithSource("regressions"),
+        )),
+        ..ProptestConfig::default()
+    })]
+
     /// Tokenization is lossless: concatenating token texts reproduces the
-    /// (whitespace-trimmed) input for both tokenizers.
+    /// (whitespace-trimmed) input for the tokenizer.
     #[test]
     fn tokenization_is_lossless_structure(line in line_strategy()) {
         let joined: String = Tokenizer::Structure
-            .tokenize(&line)
-            .iter()
-            .map(|t| t.text.as_str())
-            .collect();
-        prop_assert_eq!(joined, line);
-    }
-
-    #[test]
-    fn tokenization_is_lossless_legacy(line in line_strategy()) {
-        let joined: String = Tokenizer::Legacy
             .tokenize(&line)
             .iter()
             .map(|t| t.text.as_str())
@@ -39,9 +36,6 @@ proptest! {
     #[test]
     fn no_empty_tokens(line in line_strategy()) {
         for tok in Tokenizer::Structure.tokenize(&line) {
-            prop_assert!(!tok.text.is_empty());
-        }
-        for tok in Tokenizer::Legacy.tokenize(&line) {
             prop_assert!(!tok.text.is_empty());
         }
     }
@@ -107,6 +101,13 @@ proptest! {
 }
 
 proptest! {
+    #![proptest_config(ProptestConfig {
+        failure_persistence: Some(Box::new(
+            proptest::test_runner::FileFailurePersistence::WithSource("regressions"),
+        )),
+        ..ProptestConfig::default()
+    })]
+
     /// The timestamp parser never panics, on any input.
     #[test]
     fn parse_timestamp_never_panics(s in "\\PC{0,40}", now in proptest::num::i64::ANY) {
@@ -135,9 +136,56 @@ proptest! {
     #[test]
     fn tokenization_is_lossless_unicode(line in "[\\PC\"'=:{}]{0,60}") {
         let line = line.trim_matches(['\n', '\r']).to_string();
-        for tok in [Tokenizer::Structure, Tokenizer::Legacy] {
-            let joined: String = tok.tokenize(&line).iter().map(|t| t.text.as_str()).collect();
-            prop_assert_eq!(&joined, &line);
-        }
+        let tok = Tokenizer::Structure;
+        let joined: String = tok.tokenize(&line).iter().map(|t| t.text.as_str()).collect();
+        prop_assert_eq!(&joined, &line);
+    }
+}
+
+/// Each changing value occupies one parameter slot, even when its punctuation changes.
+#[test]
+fn variable_shapes_preserve_signatures() {
+    for (first, second) in [
+        ("connect alpha.example:80 ok", "connect beta.example:443 ok"),
+        ("mail alice@example.org ok", "mail bob@other.net ok"),
+        ("hash abcdefabcdefabcdef ok", "hash fedcbafedcbafedcba ok"),
+        (
+            "GET https://alpha.example/api?q=one&lang=en ok",
+            "GET http://beta.example/other?offset=42 ok",
+        ),
+        ("size 1,234 ok", "size 1,234,567 ok"),
+    ] {
+        let first_tokens = Tokenizer::Structure.tokenize(first);
+        let second_tokens = Tokenizer::Structure.tokenize(second);
+        assert_eq!(
+            structure_signature(&first_tokens),
+            structure_signature(&second_tokens),
+            "{first:?} and {second:?}"
+        );
+        assert_eq!(
+            first_tokens.iter().filter(|t| t.is_parameter()).count(),
+            1,
+            "{first}"
+        );
+        assert_eq!(
+            second_tokens.iter().filter(|t| t.is_parameter()).count(),
+            1,
+            "{second}"
+        );
+    }
+}
+
+#[test]
+fn quote_heavy_input_stays_lossless() {
+    for line in ["\"'é'=42 ".repeat(20_000), "\"".repeat(100_000)] {
+        let tokens = Tokenizer::Structure.tokenize(&line);
+        assert!(tokens.iter().all(|token| !token.text.is_empty()));
+        assert_eq!(
+            tokens
+                .iter()
+                .map(|token| token.text.as_str())
+                .collect::<String>(),
+            line
+        );
     }
 }

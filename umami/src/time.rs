@@ -335,11 +335,10 @@ mod tests {
             "2020-11-12 15:45:54,123 x",
             "1.2.3.4 - - [23/Jan/2020:10:23:45 +0000] \"GET /\"",
         ] {
-            for tok in [Tokenizer::Structure, Tokenizer::Legacy] {
-                let toks = tok.tokenize(line);
-                let has_ts = toks.iter().any(|t| t.ty == TokenType::Timestamp);
-                assert_eq!(has_ts, event_time(&toks, now).is_some(), "{tok:?} {line}");
-            }
+            let tok = Tokenizer::Structure;
+            let toks = tok.tokenize(line);
+            let has_ts = toks.iter().any(|t| t.ty == TokenType::Timestamp);
+            assert_eq!(has_ts, event_time(&toks, now).is_some(), "{tok:?} {line}");
         }
     }
 }

@@ -3,7 +3,7 @@ resolver = "2"
 members = ["umami", "umami-cli"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["umami contributors"]
@@ -11,7 +11,7 @@ repository = "https://codeberg.org/gregburd/umami"
 rust-version = "1.74"
 
 [workspace.dependencies]
-umami = { path = "umami", version = "0.1.0" }
+umami = { package = "umami-log", path = "umami", version = "0.2.0" }
 
 [profile.release]
 opt-level = 3

@@ -702,24 +702,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "umami"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "proptest",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "umami-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "assert_cmd",
  "clap",
  "predicates",
  "serde_json",
- "umami",
+ "umami-log",
+]
+
+[[package]]
+name = "umami-log"
+version = "0.2.0"
+dependencies = [
+ "criterion",
+ "proptest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

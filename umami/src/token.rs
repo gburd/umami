@@ -32,7 +32,7 @@ pub enum TokenType {
 }
 
 impl TokenType {
-    /// Returns the numeric discriminant used by the reference implementation.
+    /// Returns the numeric discriminant used by the test printer.
     #[inline]
     pub const fn as_u8(self) -> u8 {
         self as u8
@@ -137,18 +137,24 @@ impl Token {
 
     /// Returns `true` if this token is a dynamic parameter value: a parameter
     /// type ([`TokenType::is_parameter`]) or a literal containing a digit or
-    /// a `/` (`web01`, `/var/log/x`, `15ms`, a UUID).
+    /// a `/` (`web01`, `/var/log/x`, `15ms`, a UUID), an email address,
+    /// or a hexadecimal identifier of at least sixteen characters.
     #[inline]
     pub fn is_parameter(&self) -> bool {
         self.ty.is_parameter() || self.is_dynamic_literal()
     }
 
-    /// Digit-bearing literals are almost always ids, sizes or hostnames, and
-    /// slash-bearing ones are paths or URLs, so both are treated as variables
-    /// (the Drain pre-processing rule, plus paths).
+    /// Long hexadecimal words and email addresses vary even without digits or slashes.
     #[inline]
     fn is_dynamic_literal(&self) -> bool {
-        self.ty == TokenType::Literal && self.text.bytes().any(|b| b.is_ascii_digit() || b == b'/')
+        if self.ty != TokenType::Literal {
+            return false;
+        }
+        self.text.bytes().any(|b| b.is_ascii_digit() || b == b'/')
+            || (self.text.len() >= 16 && self.text.bytes().all(|b| b.is_ascii_hexdigit()))
+            || self.text.split_once('@').is_some_and(|(local, domain)| {
+                !local.is_empty() && !domain.is_empty() && !domain.contains('@')
+            })
     }
 }
 

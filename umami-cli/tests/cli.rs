@@ -45,14 +45,13 @@ fn tokenize_static_drops_delimiters() {
 }
 
 #[test]
-fn tokenize_legacy_tokenizer() {
+fn legacy_tokenizer_is_rejected() {
     umami()
         .args(["tokenize", "--tokenizer", "legacy"])
         .write_stdin("sshd[123]: ok\n")
         .assert()
-        .success()
-        // legacy keeps `sshd[123` as one literal
-        .stdout(predicate::str::contains("0{sshd[123}"));
+        .failure()
+        .stderr(predicate::str::contains("possible values: structure"));
 }
 
 #[test]
@@ -201,7 +200,7 @@ fn unknown_tokenizer_lists_choices() {
         .args(["pipeline", "--tokenizer", "bogus"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("structure, legacy"));
+        .stderr(predicate::str::contains("possible values: structure"));
 }
 
 #[test]
@@ -221,15 +220,13 @@ fn state_file_carries_learning_across_runs() {
     assert!(run("disk full on sda1\n", &[]).contains("never_before_seen"));
     // learned last time: filtered now
     assert_eq!(run("disk full on sda2\n", &[]), "");
-    // a state saved by another tokenizer is refused, not silently misused
+    // A state saved with a removed tokenizer is refused, not silently misused.
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+    saved["tokenizer"] = "legacy".into();
+    std::fs::write(&state, serde_json::to_vec(&saved).unwrap()).unwrap();
     umami()
-        .args([
-            "pipeline",
-            "--tokenizer",
-            "legacy",
-            "--state",
-            state.to_str().unwrap(),
-        ])
+        .args(["pipeline", "--state", state.to_str().unwrap()])
         .write_stdin("x\n")
         .assert()
         .failure()

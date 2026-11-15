@@ -1,6 +1,6 @@
 //! The structural log-line tokenizer.
 //!
-//! This module implements the `structure` and `legacy` tokenizers. Tokenization
+//! This module implements the `structure` tokenizer.  Tokenization
 //! is the first stage of anomaly detection: a raw log line is
 //! split into a sequence of typed [`Token`]s, from which a structure signature
 //! is later derived.
@@ -26,17 +26,13 @@ pub enum Tokenizer {
     /// key/value pairs, quoted strings and nested JSON. This is the default.
     #[default]
     Structure,
-    /// The original whitespace-oriented tokenizer. Splits primarily on
-    /// whitespace, keeping most punctuation attached to adjacent words.
-    Legacy,
 }
 
 impl Tokenizer {
-    /// Parses a tokenizer name (`"structure"` or `"legacy"`).
+    /// Parses a tokenizer name (`"structure"`).
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "structure" => Some(Self::Structure),
-            "legacy" => Some(Self::Legacy),
             _ => None,
         }
     }
@@ -45,7 +41,6 @@ impl Tokenizer {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Structure => "structure",
-            Self::Legacy => "legacy",
         }
     }
 
@@ -53,7 +48,6 @@ impl Tokenizer {
     pub fn tokenize(self, line: &str) -> Vec<Token> {
         match self {
             Tokenizer::Structure => tokenize_structure(line),
-            Tokenizer::Legacy => tokenize_legacy(line),
         }
     }
 }
@@ -203,12 +197,6 @@ fn match_timestamp(s: &str) -> Option<usize> {
     match_iso(s)
         .or_else(|| match_clf(s))
         .or_else(|| match_syslog(s))
-}
-
-/// Timestamp matcher for the legacy tokenizer, which recognizes only the
-/// syslog and CLF forms (not ISO 8601).
-fn match_timestamp_legacy(s: &str) -> Option<usize> {
-    match_clf(s).or_else(|| match_syslog(s))
 }
 
 fn is_digits(s: &str, n: usize) -> bool {
@@ -467,30 +455,51 @@ fn tokenize_structure_into(line: &str, tokens: &mut Vec<Token>) {
     }
 }
 
-/// Consumes a maximal word run, including a single digit-comma-digit group so
-/// that thousands-separated numbers like `1,234` stay a single token. Only one
-/// comma group is absorbed, matching the reference tokenizer (`1,234,567`
-/// becomes `1,234` `,` `567`).
+/// Consumes a word, preserving URL queries and host ports as part of the value.
 fn consume_word(s: &str) -> usize {
+    if s.starts_with("https://") || s.starts_with("http://") {
+        return s
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '\'' | '"' | '<' | '>' | ')' | ']' | '}' | ',')
+            })
+            .unwrap_or(s.len());
+    }
+
     let bytes = s.as_bytes();
     let mut i = 0;
-    let n = bytes.len();
-    let mut comma_used = false;
-    while i < n {
+    while i < bytes.len() {
         let c = s[i..].chars().next().unwrap();
         if is_word_char(c) {
             i += c.len_utf8();
         } else if c == ','
-            && !comma_used
             && i > 0
             && bytes[i - 1].is_ascii_digit()
-            && bytes.get(i + 1).is_some_and(u8::is_ascii_digit)
+            && bytes
+                .get(i + 1..i + 4)
+                .is_some_and(|group| group.iter().all(u8::is_ascii_digit))
+            && !bytes.get(i + 4).is_some_and(u8::is_ascii_digit)
         {
-            // digit,digit -> keep one comma group inside the word
-            comma_used = true;
             i += 1;
         } else {
             break;
+        }
+    }
+
+    // Bare times keep their separate numeric slots; only names and dotted hosts absorb a port.
+    let host = &s[..i];
+    if bytes.get(i) == Some(&b':')
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        && host.bytes().any(|b| b.is_ascii_alphabetic() || b == b'.')
+    {
+        let port_len = bytes[i + 1..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        let end = i + 1 + port_len;
+        if port_len > 0 && s[end..].chars().next().map_or(true, |c| !is_word_char(c)) {
+            return end;
         }
     }
     i
@@ -551,292 +560,6 @@ fn is_simple_identifier(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
-// ---------------------------------------------------------------------------
-// Legacy tokenizer
-// ---------------------------------------------------------------------------
-
-/// Strict numeric check for the legacy tokenizer: decimal integers and floats
-/// with optional `.`, `,` or `:` separators between digit groups (covering
-/// thousands groups, times and MAC/colon-separated values), but no sign, no
-/// hex and no trailing alphabetic units. Must start and end with a digit and
-/// contain no consecutive separators.
-fn is_number_legacy(word: &str) -> bool {
-    if word.is_empty() {
-        return false;
-    }
-    let bytes = word.as_bytes();
-    if !bytes[0].is_ascii_digit() || !bytes[bytes.len() - 1].is_ascii_digit() {
-        return false;
-    }
-    let mut prev_sep = false;
-    for &b in bytes {
-        match b {
-            b'0'..=b'9' => prev_sep = false,
-            b'.' | b',' | b':' => {
-                if prev_sep {
-                    return false;
-                }
-                prev_sep = true;
-            }
-            _ => return false,
-        }
-    }
-    true
-}
-
-/// The legacy tokenizer splits the line on whitespace into chunks; within each
-/// chunk it peels a leading punctuation run (merged with the preceding
-/// whitespace into a single delimiter) and a trailing punctuation run, leaving
-/// the middle as one word token. Chunks containing a double quote are emitted
-/// as a single quoted token up to the closing quote, and only the syslog/CLF
-/// timestamp forms are recognized.
-fn tokenize_legacy(line: &str) -> Vec<Token> {
-    let line = line.trim_matches(|c: char| c == '\n' || c == '\r');
-    let mut tokens = Vec::new();
-    let n = line.len();
-    let mut i = 0;
-
-    while i < n {
-        // Leading timestamp (syslog/CLF only).
-        if let Some(len) = match_timestamp_legacy(&line[i..]) {
-            tokens.push(Token::new(TokenType::Timestamp, &line[i..i + len]));
-            i += len;
-            continue;
-        }
-
-        let c = line[i..].chars().next().unwrap();
-
-        // Whitespace run: a delimiter that also absorbs a following leading
-        // punctuation run (the leading punctuation of the next chunk). If a
-        // quote is encountered, the delimiter ends just after it and a quoted
-        // span is emitted.
-        if c.is_whitespace() {
-            let start = i;
-            while i < n && line[i..].chars().next().unwrap().is_whitespace() {
-                i += line[i..].chars().next().unwrap().len_utf8();
-            }
-            let mut emitted_quote = false;
-            while i < n {
-                let ch = line[i..].chars().next().unwrap();
-                if is_legacy_word_start(ch) || ch.is_whitespace() {
-                    break;
-                }
-                if ch == '"' {
-                    if let Some((clen, closer)) = legacy_quote_close(&line[i + 1..]) {
-                        tokens.push(Token::delimiter(&line[start..i + 1]));
-                        let content_start = i + 1;
-                        let content_end = content_start + clen;
-                        push_quoted(&mut tokens, &line[content_start..content_end]);
-                        match closer {
-                            QuoteCloser::Quote => {
-                                tokens.push(Token::delimiter("\""));
-                                i = content_end + 1;
-                            }
-                            QuoteCloser::Brace => {
-                                tokens.push(Token::delimiter("}"));
-                                i = content_end + 1;
-                            }
-                        }
-                        emitted_quote = true;
-                    }
-                    break;
-                }
-                i += ch.len_utf8();
-            }
-            if !emitted_quote {
-                tokens.push(Token::delimiter(&line[start..i]));
-            }
-            continue;
-        }
-
-        // A chunk begins here. Find its end (next whitespace), but a quote may
-        // extend the span across whitespace.
-        let chunk_start = i;
-        let mut quoted_close: Option<usize> = None;
-        let mut quote_open: Option<usize> = None;
-        let mut closer = QuoteCloser::Quote;
-        while i < n {
-            let ch = line[i..].chars().next().unwrap();
-            if ch == '"' {
-                if let Some((clen, cl)) = legacy_quote_close(&line[i + 1..]) {
-                    quote_open = Some(i);
-                    quoted_close = Some(i + 1 + clen);
-                    closer = cl;
-                    break;
-                }
-            }
-            if ch.is_whitespace() {
-                break;
-            }
-            if i != chunk_start && match_timestamp_legacy(&line[i..]).is_some() {
-                break;
-            }
-            i += ch.len_utf8();
-        }
-
-        if let (Some(open), Some(close)) = (quote_open, quoted_close) {
-            let prefix = &line[chunk_start..open];
-            if !prefix.is_empty() && prefix.chars().all(|c| !is_legacy_word_start(c)) {
-                // Punctuation-only prefix (e.g. `{`): merge with the opening
-                // quote into a single delimiter, content becomes the quoted
-                // token.
-                tokens.push(Token::delimiter(&line[chunk_start..open + 1]));
-                push_quoted(&mut tokens, &line[open + 1..close]);
-            } else {
-                // Word prefix (e.g. `msg="`): the prefix and opening quote are
-                // part of the quoted token.
-                push_quoted(&mut tokens, &line[chunk_start..close]);
-            }
-            match closer {
-                QuoteCloser::Quote => tokens.push(Token::delimiter("\"")),
-                QuoteCloser::Brace => tokens.push(Token::delimiter("}")),
-            }
-            i = close + 1;
-            continue;
-        }
-
-        let chunk = &line[chunk_start..i];
-        emit_legacy_chunk(chunk, &mut tokens);
-    }
-    tokens
-}
-
-/// Pushes a [`TokenType::Quoted`] token, skipping it when the content is empty
-/// (preserving the "no empty tokens" invariant on pathological quote input).
-fn push_quoted(tokens: &mut Vec<Token>, content: &str) {
-    if !content.is_empty() {
-        tokens.push(Token::new(TokenType::Quoted, content));
-    }
-}
-
-/// Locates the end of a legacy quoted span given the text immediately after an
-/// opening quote. Returns `(content_len, closer)` where `content_len` is the
-/// byte length of the quoted content and `closer` describes the closing
-/// delimiter:
-///
-/// * the span closes at a `"` that is followed by whitespace, `}` or end; or
-/// * it closes at a `}` (JSON object end), which itself forms the delimiter.
-///
-/// Returns `None` for an unterminated quote (the opening quote is then treated
-/// literally by the caller).
-fn legacy_quote_close(after: &str) -> Option<(usize, QuoteCloser)> {
-    let bytes = after.as_bytes();
-    let mut j = 0;
-    while j < bytes.len() {
-        match bytes[j] {
-            b'"' => {
-                let next = bytes.get(j + 1);
-                match next {
-                    None => return Some((j, QuoteCloser::Quote)),
-                    Some(&b) if (b as char).is_whitespace() || b == b'}' => {
-                        return Some((j, QuoteCloser::Quote))
-                    }
-                    _ => {}
-                }
-            }
-            b'}' => return Some((j, QuoteCloser::Brace)),
-            _ => {}
-        }
-        j += 1;
-    }
-    None
-}
-
-/// How a legacy quoted span is terminated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QuoteCloser {
-    /// Terminated by a closing `"`.
-    Quote,
-    /// Terminated by a `}` (JSON object end); the `}` is the delimiter.
-    Brace,
-}
-
-/// Emits the tokens for a single whitespace-delimited legacy chunk that
-/// contains no spanning quote.
-fn emit_legacy_chunk(chunk: &str, tokens: &mut Vec<Token>) {
-    if chunk.is_empty() {
-        return;
-    }
-    // A leading `{"` or `"` with the rest being a quoted span handled above is
-    // not expected here; treat any residual quote as a literal character.
-
-    // Peel a leading punctuation run.
-    let (leading, body) = split_leading_punct(chunk);
-    if !leading.is_empty() {
-        tokens.push(Token::delimiter(leading));
-    }
-    if body.is_empty() {
-        return;
-    }
-    let (word, trailing) = split_trailing_punct(body);
-    if !word.is_empty() {
-        tokens.push(Token::new(classify_legacy(word), word));
-    }
-    if !trailing.is_empty() {
-        tokens.push(Token::delimiter(trailing));
-    }
-}
-
-/// Splits a chunk into `(leading_punct, rest)` by peeling a leading run of
-/// non-word characters.
-fn split_leading_punct(chunk: &str) -> (&str, &str) {
-    for (idx, ch) in chunk.char_indices() {
-        if is_legacy_word_start(ch) {
-            return chunk.split_at(idx);
-        }
-    }
-    // all punctuation
-    (chunk, "")
-}
-
-/// A character that can begin (and appear within) a legacy word token.
-#[inline]
-fn is_legacy_word_start(c: char) -> bool {
-    c.is_alphanumeric() || (!c.is_ascii() && !c.is_whitespace())
-}
-
-/// Splits a chunk into `(word, trailing_punct)` by peeling a trailing run of
-/// non-word characters. Punctuation interior to the word is retained.
-fn split_trailing_punct(chunk: &str) -> (&str, &str) {
-    let mut end = chunk.len();
-    for (idx, ch) in chunk.char_indices().rev() {
-        if is_legacy_word_start(ch) {
-            end = idx + ch.len_utf8();
-            break;
-        }
-        if idx == 0 {
-            end = 0;
-        }
-    }
-    chunk.split_at(end)
-}
-
-/// Classifies a legacy word: IPv4, number or literal.
-fn classify_legacy(word: &str) -> TokenType {
-    if is_ipv4(word) {
-        TokenType::Ipv4
-    } else if is_number_legacy(word) {
-        TokenType::Number
-    } else {
-        TokenType::Literal
-    }
-}
-
-/// Whether `word` is a dotted-quad IPv4 address.
-fn is_ipv4(word: &str) -> bool {
-    let mut parts = 0;
-    for part in word.split('.') {
-        parts += 1;
-        if part.is_empty() || part.len() > 3 || !part.bytes().all(|b| b.is_ascii_digit()) {
-            return false;
-        }
-        if part.parse::<u16>().map(|v| v > 255).unwrap_or(true) {
-            return false;
-        }
-    }
-    parts == 4
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -847,6 +570,45 @@ mod tests {
             .map(Token::to_string)
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    #[test]
+    fn host_port_is_one_parameter() {
+        let tokens = tokenize("alpha.example:8080");
+        assert_eq!(tokens.len(), 1);
+        assert!(tokens[0].is_parameter());
+    }
+
+    #[test]
+    fn email_is_a_parameter() {
+        assert!(tokenize("alice@example.org")[0].is_parameter());
+    }
+
+    #[test]
+    fn long_hex_is_a_parameter_not_a_word() {
+        assert!(tokenize("abcdefabcdefabcdef")[0].is_parameter());
+        assert!(tokenize("decade")[0].is_structural());
+    }
+
+    #[test]
+    fn url_query_is_one_parameter() {
+        let tokens = tokenize("https://example.org/path?q=word&lang=en");
+        assert_eq!(tokens.len(), 1);
+        assert!(tokens[0].is_parameter());
+    }
+
+    #[test]
+    fn comma_lists_do_not_become_grouped_numbers() {
+        assert_eq!(
+            s("[1,2,3,4]"),
+            "1{[} 5{1} 1{,} 5{2} 1{,} 5{3} 1{,} 5{4} 1{]}"
+        );
+        assert_eq!(s("1,2345"), "5{1} 1{,} 5{2345}");
+    }
+
+    #[test]
+    fn grouped_number_is_one_parameter() {
+        assert_eq!(s("1,234,567"), "5{1,234,567}");
     }
 
     #[test]

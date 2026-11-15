@@ -16,19 +16,18 @@ fn bench(c: &mut Criterion) {
     let corpus: Vec<&str> = SAMPLES.iter().copied().cycle().take(10_000).collect();
     let bytes: usize = corpus.iter().map(|l| l.len()).sum();
 
-    for tok in [Tokenizer::Structure, Tokenizer::Legacy] {
-        let name = tok.name();
-        let mut group = c.benchmark_group(format!("tokenize/{name}"));
-        group.throughput(Throughput::Bytes(bytes as u64));
-        group.bench_function("10k_lines", |b| {
-            b.iter(|| {
-                for line in &corpus {
-                    black_box(tok.tokenize(black_box(line)));
-                }
-            })
-        });
-        group.finish();
-    }
+    let tok = Tokenizer::Structure;
+    let name = tok.name();
+    let mut group = c.benchmark_group(format!("tokenize/{name}"));
+    group.throughput(Throughput::Bytes(bytes as u64));
+    group.bench_function("10k_lines", |b| {
+        b.iter(|| {
+            for line in &corpus {
+                black_box(tok.tokenize(black_box(line)));
+            }
+        })
+    });
+    group.finish();
 }
 
 criterion_group!(benches, bench);
