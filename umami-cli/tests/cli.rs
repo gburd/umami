@@ -1108,3 +1108,28 @@ fn historical_anchor_can_precede_a_wall_clock_observation() {
         .assert()
         .success();
 }
+
+#[test]
+fn untimed_tagged_events_follow_stream_clock_not_year_anchor() {
+    let state = scratch("tagged-mixed-time").join("s.json");
+    let mut input = "b\t2020-01-01 00:00:00 service ready\n".to_string();
+    for minute in 0..25 {
+        input += &format!("a\t2020-01-01 00:{minute:02}:00 tick\nb\tservice ready\n");
+    }
+    umami()
+        .args(["ingest", "--tagged", "--state", state.to_str().unwrap()])
+        .write_stdin(input)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"kind\":\"system_away\"").not());
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(state).unwrap()).unwrap();
+    let profile = saved["store"]["systems"]["b"]
+        .as_object()
+        .unwrap()
+        .values()
+        .find(|profile| profile["signature"] == "service ready")
+        .unwrap();
+    assert_eq!(profile["last_seen"], 1_577_838_240i64);
+    assert_eq!(profile["interval_stats"]["mean"], 60.0);
+    assert_eq!(saved["anchors"]["b"], 1_577_836_800i64);
+}

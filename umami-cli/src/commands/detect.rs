@@ -227,9 +227,7 @@ impl Session {
             .copied()
             .max()
             .unwrap_or_else(wall_clock);
-        let now = parsed
-            .or_else(|| self.anchors.get(system).copied())
-            .unwrap_or(latest);
+        let now = parsed.unwrap_or(latest);
         let mut out = Vec::new();
         self.dirty = true;
         if latest >= self.next_sweep {
