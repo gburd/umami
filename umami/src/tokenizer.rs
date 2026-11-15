@@ -386,6 +386,7 @@ fn tokenize_structure_into(line: &str, tokens: &mut Vec<Token>) {
     let bytes = line.as_bytes();
     let mut i = 0;
     let n = bytes.len();
+    let mut array_depth = 0usize;
 
     while i < n {
         let c = line[i..].chars().next().unwrap();
@@ -441,11 +442,18 @@ fn tokenize_structure_into(line: &str, tokens: &mut Vec<Token>) {
             if signed_number {
                 i += c.len_utf8();
             }
-            i += consume_word(&line[i..]);
+            i += consume_word(&line[i..], array_depth == 0);
             let word = &line[start..i];
             let ty = classify_word(word);
             tokens.push(Token::new(ty, word));
             continue;
+        }
+
+        // Quoted contents recurse with their own bracket context.
+        match c {
+            '[' => array_depth += 1,
+            ']' => array_depth = array_depth.saturating_sub(1),
+            _ => {}
         }
 
         // 5) Any other single character is a delimiter.
@@ -456,13 +464,17 @@ fn tokenize_structure_into(line: &str, tokens: &mut Vec<Token>) {
 }
 
 /// Consumes a word, preserving URL queries and host ports as part of the value.
-fn consume_word(s: &str) -> usize {
+fn consume_word(s: &str, grouped_numbers: bool) -> usize {
     if s.starts_with("https://") || s.starts_with("http://") {
         return s
             .find(|c: char| {
-                c.is_whitespace() || matches!(c, '\'' | '"' | '<' | '>' | ')' | ']' | '}' | ',')
+                c.is_whitespace() || matches!(c, '\'' | '"' | '<' | '>' | ')' | ']' | '}')
             })
             .unwrap_or(s.len());
+    }
+
+    if let Some(len) = email_length(s) {
+        return len;
     }
 
     let bytes = s.as_bytes();
@@ -472,6 +484,7 @@ fn consume_word(s: &str) -> usize {
         if is_word_char(c) {
             i += c.len_utf8();
         } else if c == ','
+            && grouped_numbers
             && i > 0
             && bytes[i - 1].is_ascii_digit()
             && bytes
@@ -485,13 +498,14 @@ fn consume_word(s: &str) -> usize {
         }
     }
 
-    // Bare times keep their separate numeric slots; only names and dotted hosts absorb a port.
+    // Bare labels and times retain their structure; only dotted hosts absorb a port.
     let host = &s[..i];
     if bytes.get(i) == Some(&b':')
         && host
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
-        && host.bytes().any(|b| b.is_ascii_alphabetic() || b == b'.')
+        && host.contains('.')
+        && host.split('.').all(|label| !label.is_empty())
     {
         let port_len = bytes[i + 1..]
             .iter()
@@ -503,6 +517,26 @@ fn consume_word(s: &str) -> usize {
         }
     }
     i
+}
+
+/// Recognizes an unquoted email address without changing ordinary plus-separated words.
+fn email_length(s: &str) -> Option<usize> {
+    // Bound lookahead by the email length limit, including for malformed plus-heavy input.
+    let len = s
+        .bytes()
+        .take(255)
+        .take_while(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'%' | b'+' | b'-' | b'@')
+        })
+        .count();
+    if len > 254 {
+        return None;
+    }
+    let (local, domain) = s[..len].split_once('@')?;
+    if local.is_empty() || domain.is_empty() || domain.contains('@') {
+        return None;
+    }
+    Some(len)
 }
 
 /// Classifies a completed word token.

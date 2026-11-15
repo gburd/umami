@@ -189,3 +189,53 @@ fn quote_heavy_input_stays_lossless() {
         );
     }
 }
+
+#[test]
+fn bare_colon_labels_remain_structural() {
+    let first = Tokenizer::Structure.tokenize("event error:123");
+    let second = Tokenizer::Structure.tokenize("event warning:456");
+    assert_ne!(structure_signature(&first), structure_signature(&second));
+}
+
+#[test]
+fn array_commas_separate_numeric_slots() {
+    for (first, second) in [
+        ("value [1,234,567]", "value [1,2,3]"),
+        ("value [[1,234],567]", "value [[1,2],3]"),
+    ] {
+        let first = Tokenizer::Structure.tokenize(first);
+        let second = Tokenizer::Structure.tokenize(second);
+        assert_eq!(structure_signature(&first), structure_signature(&second));
+        assert_eq!(first.iter().filter(|t| t.is_parameter()).count(), 3);
+    }
+    let tokens = Tokenizer::Structure.tokenize("value [1,234] total 1,234,567");
+    assert_eq!(tokens.iter().filter(|t| t.is_parameter()).count(), 3);
+    let quoted = Tokenizer::Structure.tokenize(r#"["1,234,567",2]"#);
+    assert_eq!(quoted.iter().filter(|t| t.is_parameter()).count(), 2);
+}
+
+#[test]
+fn plus_email_stays_one_parameter_without_merging_words() {
+    let first = Tokenizer::Structure.tokenize("mail alice+alerts@example.org");
+    let second = Tokenizer::Structure.tokenize("mail bob@example.net");
+    assert_eq!(structure_signature(&first), structure_signature(&second));
+    assert_eq!(first.last().unwrap().text, "alice+alerts@example.org");
+    let words = Tokenizer::Structure.tokenize("alpha+beta");
+    assert_eq!(words.len(), 3);
+    assert!(words[0].is_structural());
+    assert!(words[2].is_structural());
+    let long = format!("{}@example.org", "a+".repeat(200));
+    let tokens = Tokenizer::Structure.tokenize(&long);
+    assert_eq!(
+        tokens.iter().map(|t| t.text.as_str()).collect::<String>(),
+        long
+    );
+}
+
+#[test]
+fn url_query_commas_stay_in_parameter() {
+    let first = Tokenizer::Structure.tokenize("GET https://example.org/?q=one,two");
+    let second = Tokenizer::Structure.tokenize("GET https://example.org/?q=three");
+    assert_eq!(structure_signature(&first), structure_signature(&second));
+    assert_eq!(first.last().unwrap().text, "https://example.org/?q=one,two");
+}
