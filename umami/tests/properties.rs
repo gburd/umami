@@ -15,7 +15,7 @@ fn line_strategy() -> impl Strategy<Value = String> {
 proptest! {
     #![proptest_config(ProptestConfig {
         failure_persistence: Some(Box::new(
-            proptest::test_runner::FileFailurePersistence::WithSource("regressions"),
+            proptest::test_runner::FileFailurePersistence::WithSource("proptest-regressions"),
         )),
         ..ProptestConfig::default()
     })]
@@ -103,7 +103,7 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig {
         failure_persistence: Some(Box::new(
-            proptest::test_runner::FileFailurePersistence::WithSource("regressions"),
+            proptest::test_runner::FileFailurePersistence::WithSource("proptest-regressions"),
         )),
         ..ProptestConfig::default()
     })]
