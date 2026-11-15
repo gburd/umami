@@ -111,17 +111,29 @@ impl State {
         if matches!(envelope.clock, Clock::Wall) != envelope.anchors.is_empty() {
             return Err(fail("state clock and anchors disagree").into());
         }
-        if envelope
-            .anchors
-            .values()
-            .any(|&t| t > super::wall_clock().saturating_add(86_400))
-        {
+        if envelope.anchors.values().any(|&t| {
+            !umami::time::is_supported_timestamp(t)
+                || t > super::wall_clock().saturating_add(86_400)
+        }) {
             return Err(fail("state contains a future timestamp").into());
         }
         envelope
             .store
             .validate(super::wall_clock())
             .map_err(|e| fail(&format!("invalid learned state: {e}")))?;
+        for (system, anchor) in &envelope.anchors {
+            let latest = envelope
+                .store
+                .iter_systems()
+                .find(|(name, _)| *name == system)
+                .and_then(|(_, profiles)| profiles.values().map(|p| p.last_seen).max());
+            if latest.is_none_or(|latest| *anchor > latest) {
+                return Err(fail(&format!(
+                    "anchor for {system:?} lacks a matching learned observation"
+                ))
+                .into());
+            }
+        }
         Ok((envelope.store, envelope.anchors))
     }
 

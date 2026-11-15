@@ -142,6 +142,13 @@ fn unix(year: i64, month: i64, day: i64, secs: i64) -> Option<i64> {
 /// Unix time range of years 0..=9999, which `now` is clamped to.
 const NOW_RANGE: std::ops::RangeInclusive<i64> = -62_167_219_200..=253_402_300_799;
 
+/// Whether Unix seconds fall in the supported UTC civil years 0 through 9999.
+///
+/// Use this after timezone conversion and before accepting persistent event time.
+pub fn is_supported_timestamp(time: i64) -> bool {
+    NOW_RANGE.contains(&time)
+}
+
 /// Days since 1970-01-01 (Howard Hinnant's `days_from_civil`).
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
@@ -376,6 +383,17 @@ mod tests {
 mod continuing_tests {
     use super::*;
     use crate::tokenizer::Tokenizer;
+
+    #[test]
+    fn supported_utc_boundaries_include_both_endpoints() {
+        let first = parse_timestamp("0000-01-01T00:00:00Z", 0).unwrap();
+        let last = parse_timestamp("9999-12-31T23:59:59Z", 0).unwrap();
+        assert!(is_supported_timestamp(first));
+        assert!(is_supported_timestamp(last));
+        for outside in [i64::MIN, first - 1, last + 1, i64::MAX] {
+            assert!(!is_supported_timestamp(outside));
+        }
+    }
 
     #[test]
     fn continuing_year_keeps_small_late_events_and_rolls_over_large_backward_jumps() {

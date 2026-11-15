@@ -204,6 +204,11 @@ impl Session {
             };
             (tokens, parsed)
         };
+        if parsed.is_some_and(|t| !umami::time::is_supported_timestamp(t)) {
+            return Err(
+                "event time outside supported timestamp range (UTC years 0 through 9999)".into(),
+            );
+        }
         if parsed.is_some_and(|t| t > wall_clock().saturating_add(86_400)) {
             return Err("future timestamp exceeds wall clock plus one day".into());
         }

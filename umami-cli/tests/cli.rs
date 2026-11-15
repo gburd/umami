@@ -1029,3 +1029,82 @@ fn parse_error_drains_preceding_accepted_output() {
     assert!(!wait_for_exit(&mut child).success());
     assert_eq!(output, format!("never_before_seen  {accepted}\n"));
 }
+
+#[test]
+fn anchors_must_name_known_systems_and_not_exceed_learned_time() {
+    let state = scratch("anchor-consistency").join("s.json");
+    umami()
+        .args(["sim", "--state", state.to_str().unwrap()])
+        .write_stdin("2020-01-01 00:00:00 tick\n")
+        .assert()
+        .success();
+    let good: serde_json::Value = serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+    let mut ahead = good.clone();
+    ahead["anchors"]["stdin"] = serde_json::json!(1_735_689_600i64);
+    assert_state_rejected(&state, &ahead);
+    let mut unknown = good;
+    unknown["anchors"]["unknown"] = serde_json::json!(1_577_836_800i64);
+    assert_state_rejected(&state, &unknown);
+}
+
+#[test]
+fn input_outside_supported_time_range_does_not_change_state() {
+    for (name, extra, seed, bad) in [
+        (
+            "auto",
+            vec![],
+            "2020-01-01 00:00:00 tick\n",
+            "0000-01-01T00:00:00+0100 tick\n",
+        ),
+        (
+            "explicit",
+            vec!["--time-format", "%Y/%m/%d %H:%M:%S"],
+            "2020/01/01 00:00:00 tick\n",
+            "-0001/01/01 00:00:00 tick\n",
+        ),
+    ] {
+        let state = scratch(&format!("range-{name}")).join("s.json");
+        umami()
+            .args(["sim", "--state", state.to_str().unwrap()])
+            .args(&extra)
+            .write_stdin(seed)
+            .assert()
+            .success();
+        let before = std::fs::read(&state).unwrap();
+        umami()
+            .args(["sim", "--state", state.to_str().unwrap()])
+            .args(&extra)
+            .write_stdin(bad)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("supported timestamp range"));
+        assert_eq!(std::fs::read(state).unwrap(), before);
+    }
+}
+
+#[test]
+fn earliest_supported_timestamp_roundtrips_through_state() {
+    let state = scratch("range-boundary").join("s.json");
+    for _ in 0..2 {
+        umami()
+            .args(["sim", "--state", state.to_str().unwrap()])
+            .write_stdin("0000-01-01T00:00:00Z tick\n")
+            .assert()
+            .success();
+    }
+}
+
+#[test]
+fn historical_anchor_can_precede_a_wall_clock_observation() {
+    let state = scratch("wall-to-event-anchor").join("s.json");
+    umami()
+        .args(["sim", "--state", state.to_str().unwrap()])
+        .write_stdin("plain wall clock event\n2020-01-01 00:00:00 historical event\n")
+        .assert()
+        .success();
+    umami()
+        .args(["sim", "--state", state.to_str().unwrap()])
+        .write_stdin("2020-01-01 00:01:00 historical event\n")
+        .assert()
+        .success();
+}

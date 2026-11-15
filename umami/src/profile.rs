@@ -240,7 +240,10 @@ impl Profile {
             }
         }
         if let Some(minute) = self.rate.minute {
-            if !(-62_167_219_200i64.div_euclid(60)..=upper.div_euclid(60)).contains(&minute)
+            if !minute
+                .checked_mul(60)
+                .is_some_and(crate::time::is_supported_timestamp)
+                || minute > upper.div_euclid(60)
                 || minute != self.last_seen.div_euclid(60)
             {
                 return Err("rate.minute outside last_seen minute".into());
@@ -356,7 +359,7 @@ impl ProfileStore {
     /// fit years 0 through 9999 and cannot exceed `now` by more than one day.
     /// Errors identify the system, profile, and inconsistent field.
     pub fn validate(&self, now: i64) -> Result<(), String> {
-        let upper = now.saturating_add(86_400).min(253_402_300_799);
+        let upper = now.saturating_add(86_400);
         let mut hashes = HashSet::new();
         for (system, profiles) in &self.systems {
             for (hash, profile) in profiles {
@@ -462,7 +465,7 @@ impl ProfileStore {
 
 /// Restricts restored times to the parser's supported civil-date range.
 fn validate_time(time: i64, upper: i64, field: &str) -> Result<(), String> {
-    if !(-62_167_219_200..=upper).contains(&time) {
+    if !crate::time::is_supported_timestamp(time) || time > upper {
         return Err(format!(
             "{field} outside supported timestamp range or in the future"
         ));
