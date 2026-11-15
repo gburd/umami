@@ -529,7 +529,7 @@ fn email_length(s: &str) -> Option<usize> {
             b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'%' | b'+' | b'-' | b'@')
         })
         .count();
-    if len > 254 {
+    if len > 254 || s[len..].chars().next().is_some_and(is_word_char) {
         return None;
     }
     let (local, domain) = s[..len].split_once('@')?;

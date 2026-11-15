@@ -239,3 +239,17 @@ fn url_query_commas_stay_in_parameter() {
     assert_eq!(structure_signature(&first), structure_signature(&second));
     assert_eq!(first.last().unwrap().text, "https://example.org/?q=one,two");
 }
+
+#[test]
+fn email_prefix_preserves_unicode_word() {
+    let tokens = Tokenizer::Structure.tokenize("mail alice@büro.example ok");
+    assert_eq!(tokens[2].text, "alice@büro.example");
+    assert_eq!(umami::signature::structure_string(&tokens), "mail <*> ok");
+}
+
+#[test]
+fn email_prefix_preserves_path_word() {
+    let tokens = Tokenizer::Structure.tokenize("path user@host/cache ok");
+    assert_eq!(tokens[2].text, "user@host/cache");
+    assert_eq!(umami::signature::structure_string(&tokens), "path <*> ok");
+}
