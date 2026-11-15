@@ -135,6 +135,8 @@ struct MinuteRate {
     count: u64,
     stats: RunningStats,
     reported: bool,
+    #[cfg_attr(feature = "serde", serde(default))]
+    discard: bool,
 }
 
 impl MinuteRate {
@@ -146,11 +148,16 @@ impl MinuteRate {
                 return None;
             }
             if minute > previous {
-                self.stats.push(self.count as f64);
+                if !self.discard {
+                    self.stats.push(self.count as f64);
+                }
+                self.discard = false;
                 self.stats.push_zeros((minute - previous - 1) as u64);
                 self.count = 0;
                 self.reported = false;
             }
+        } else {
+            self.discard = now.rem_euclid(60) != 0;
         }
         self.minute = Some(minute);
         self.count = self.count.saturating_add(1);
@@ -410,6 +417,16 @@ mod tests {
         assert_eq!(s.zscore(1.0), 0.0); // no variance
         s.push(100.0);
         assert!(s.zscore(100.0) > 0.0);
+    }
+
+    #[test]
+    fn partial_first_minute_does_not_count_toward_warmup() {
+        for start in [59, -1] {
+            let mut rate = MinuteRate::default();
+            rate.observe(start);
+            assert_eq!(rate.observe(start + 1741), None);
+            assert!(rate.observe(start + 1801).is_some());
+        }
     }
 
     #[test]

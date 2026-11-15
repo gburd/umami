@@ -10,7 +10,7 @@
 //! * **Parameter change** — a known structure with a previously unseen value
 //!   in one of its dynamic parameters.
 //! * **Frequency spike**: a minute count above the learned completed-minute
-//!   baseline (graded small/medium/large by z-score).
+//!   baseline, reported immediately at the configured z-score threshold.
 //! * **Event stop** — a periodic structure that has gone silent.
 //! * **System away** — a system that has stopped sending data entirely.
 //!
@@ -33,7 +33,7 @@ pub enum AnomalyKind {
     /// Known structure, new parameter value.
     ParameterChange,
     /// Arrival rate significantly above the learned baseline.
-    FrequencySpike(SpikeMagnitude),
+    FrequencySpike,
     /// A periodic event that has stopped occurring.
     EventStop,
     /// A system that has stopped reporting entirely.
@@ -47,22 +47,11 @@ impl AnomalyKind {
             AnomalyKind::NeverBeforeSeen => "never_before_seen",
             AnomalyKind::NewInSystem => "new_in_system",
             AnomalyKind::ParameterChange => "parameter_change",
-            AnomalyKind::FrequencySpike(_) => "frequency_spike",
+            AnomalyKind::FrequencySpike => "frequency_spike",
             AnomalyKind::EventStop => "event_stop",
             AnomalyKind::SystemAway => "system_away",
         }
     }
-}
-
-/// The graded severity of a [`AnomalyKind::FrequencySpike`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SpikeMagnitude {
-    /// Small spike (z-score over the small threshold).
-    Small,
-    /// Medium spike.
-    Medium,
-    /// Large spike.
-    Large,
 }
 
 /// A detected anomaly, returned by [`Detector::observe`] and
@@ -80,7 +69,7 @@ pub struct Anomaly {
     pub signature: String,
     /// The original log line (empty for anomalies found by a sweep).
     pub line: String,
-    /// A score in `[0, 1]` indicating how significant the anomaly is.
+    /// A fixed category weight in `[0, 1]`, not a probability or measured severity.
     pub score: f64,
     /// Dynamic parameter ordinals whose values changed after stable learning.
     /// Timestamp tokens consume an ordinal but never appear here.
@@ -98,13 +87,10 @@ pub struct DetectorConfig {
     /// profile has been seen this many times.  Minute-count and stable-parameter
     /// learning impose their own additional minimums.
     pub learn_threshold: u64,
-    /// z-score above which a minute count is a small spike, after thirty
-    /// completed minutes.  Variance has a floor of the mean or one.
-    pub spike_small: f64,
-    /// z-score for a medium spike.
-    pub spike_medium: f64,
-    /// z-score for a large spike.
-    pub spike_large: f64,
+    /// z-score above which a minute count triggers a spike, after thirty
+    /// complete minutes.  The first partial minute does not enter the baseline.
+    /// Variance has a floor of the mean or one.
+    pub spike_threshold: f64,
     /// Whether to emit parameter-change anomalies.
     pub detect_parameter_changes: bool,
     /// [`Detector::sweep`] reports an [`AnomalyKind::EventStop`] when a
@@ -120,9 +106,7 @@ impl Default for DetectorConfig {
         Self {
             tokenizer: Tokenizer::Structure,
             learn_threshold: 1,
-            spike_small: 3.0,
-            spike_medium: 6.0,
-            spike_large: 12.0,
+            spike_threshold: 3.0,
             detect_parameter_changes: false,
             stop_factor: 3.0,
             away_secs: 600,
@@ -238,17 +222,8 @@ impl Detector {
         let (profile, _created) = self.store.get_or_insert(system, hash, tokens, now);
         let learned = !profile.is_newish(cfg.learn_threshold);
         let z = profile.observe_time(now);
-        let spike = z.and_then(|z| {
-            if !learned || z < cfg.spike_small || !profile.report_spike(now) {
-                None
-            } else if z >= cfg.spike_large {
-                Some(SpikeMagnitude::Large)
-            } else if z >= cfg.spike_medium {
-                Some(SpikeMagnitude::Medium)
-            } else {
-                Some(SpikeMagnitude::Small)
-            }
-        });
+        let spike =
+            learned && z.is_some_and(|z| z >= cfg.spike_threshold) && profile.report_spike(now);
 
         let mut changed_params = Vec::new();
         if cfg.detect_parameter_changes {
@@ -268,8 +243,8 @@ impl Detector {
         // Priority: structural novelty > frequency spike > parameter change.
         let kind = if let Some(k) = structural_kind {
             Some(k)
-        } else if let Some(mag) = spike {
-            Some(AnomalyKind::FrequencySpike(mag))
+        } else if spike {
+            Some(AnomalyKind::FrequencySpike)
         } else if !changed_params.is_empty() {
             Some(AnomalyKind::ParameterChange)
         } else {
@@ -358,14 +333,12 @@ impl Detector {
     }
 }
 
-/// Assigns a `[0,1]` significance score to an anomaly kind.
+/// Assigns a fixed category weight, not an estimated probability or severity.
 fn score_for(kind: AnomalyKind) -> f64 {
     match kind {
         AnomalyKind::NeverBeforeSeen => 1.0,
         AnomalyKind::NewInSystem => 0.8,
-        AnomalyKind::FrequencySpike(SpikeMagnitude::Large) => 0.9,
-        AnomalyKind::FrequencySpike(SpikeMagnitude::Medium) => 0.6,
-        AnomalyKind::FrequencySpike(SpikeMagnitude::Small) => 0.4,
+        AnomalyKind::FrequencySpike => 0.4,
         AnomalyKind::ParameterChange => 0.5,
         AnomalyKind::EventStop => 0.7,
         AnomalyKind::SystemAway => 0.85,
@@ -506,13 +479,44 @@ mod tests {
             .filter_map(|_| d.observe("h", "request", 1800))
             .collect();
         assert_eq!(alerts.len(), 1);
-        assert!(matches!(alerts[0].kind, AnomalyKind::FrequencySpike(_)));
+        assert!(matches!(alerts[0].kind, AnomalyKind::FrequencySpike));
+    }
+
+    #[test]
+    fn partial_first_minute_does_not_hide_a_flood() {
+        for start in [0, 59] {
+            let mut d = Detector::new();
+            for second in start..1860 {
+                for _ in 0..100 {
+                    d.observe("h", "request", second);
+                }
+            }
+            let alerts: Vec<_> = (0..8000)
+                .filter_map(|_| d.observe("h", "request", 1860))
+                .collect();
+            assert_eq!(alerts.len(), 1, "start={start}");
+        }
+    }
+
+    #[test]
+    fn spike_is_immediate_and_ungraded() {
+        let mut d = Detector::new();
+        for t in (0..1800).step_by(60) {
+            d.observe("h", "request", t);
+        }
+        let alerts: Vec<_> = (1..=10_000)
+            .filter_map(|count| d.observe("h", "request", 1800).map(|a| (count, a)))
+            .collect();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].0, 4);
+        assert_eq!(alerts[0].1.kind, AnomalyKind::FrequencySpike);
+        assert_eq!(alerts[0].1.score, 0.4);
     }
 
     #[test]
     fn zero_threshold_does_not_bypass_warmup_or_admit_late_events() {
         let mut cfg = DetectorConfig::default();
-        cfg.spike_small = 0.0;
+        cfg.spike_threshold = 0.0;
         let mut d = Detector::with_config(cfg);
         for t in (0..1800).step_by(60) {
             assert_eq!(
@@ -522,7 +526,7 @@ mod tests {
         }
         assert!(matches!(
             d.observe("h", "request", 1800).unwrap().kind,
-            AnomalyKind::FrequencySpike(_)
+            AnomalyKind::FrequencySpike
         ));
         // A fresh profile has no cooldown to hide accidental late-event alerts.
         cfg.learn_threshold = 100;
@@ -625,7 +629,7 @@ mod tests {
                 .filter_map(|_| d.observe(system, line, 1832))
                 .collect();
             assert_eq!(alerts.len(), 1);
-            assert!(matches!(alerts[0].kind, AnomalyKind::FrequencySpike(_)));
+            assert!(matches!(alerts[0].kind, AnomalyKind::FrequencySpike));
         }
     }
 
@@ -644,7 +648,7 @@ mod tests {
         }
         assert!(matches!(
             d.observe("h", "request", 1810).map(|a| a.kind),
-            Some(AnomalyKind::FrequencySpike(_))
+            Some(AnomalyKind::FrequencySpike)
         ));
     }
 
@@ -794,7 +798,7 @@ mod serde_tests {
         );
         assert!(matches!(
             d.observe("h", "request", 1800).unwrap().kind,
-            AnomalyKind::FrequencySpike(_)
+            AnomalyKind::FrequencySpike
         ));
         let json = serde_json::to_string(d.store()).unwrap();
         let mut d = Detector::with_store(
@@ -836,5 +840,26 @@ mod serde_tests {
             [0]
         );
         assert!(d.sweep(1291).is_empty());
+    }
+
+    #[test]
+    fn initial_partial_minute_stays_excluded_after_restart() {
+        let mut d = Detector::new();
+        d.observe("h", "request", 59);
+        let json = serde_json::to_string(d.store()).unwrap();
+        let mut d = Detector::with_store(
+            DetectorConfig::default(),
+            serde_json::from_str(&json).unwrap(),
+        );
+        for t in (60..1800).step_by(60) {
+            d.observe("h", "request", t);
+        }
+        for _ in 0..100 {
+            assert!(d.observe("h", "request", 1800).is_none());
+        }
+        let alerts: Vec<_> = (0..100)
+            .filter_map(|_| d.observe("h", "request", 1860))
+            .collect();
+        assert_eq!(alerts.len(), 1);
     }
 }
