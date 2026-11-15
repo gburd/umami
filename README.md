@@ -1,409 +1,188 @@
 # umami
 
-`umami` is a Rust log anomaly-detection toolkit: it learns the *structure* of
-streaming log events and surfaces only the new, changed, and anomalous lines,
-filtering out the bulk of repetitive, already-seen traffic.
+umami filters repetitive log events by their structure.  It reports a structure on first sight,
+then tracks changes in frequency and stable parameter values.  The library package is umami-log;
+Rust code imports umami, and the command-line executable is umami.
 
-The workspace contains two crates:
+umami detects novelty, not whether a message describes a failure.  A known error returning on
+another day need not produce an alert.  Keep explicit monitoring rules for known failures.
 
-| Crate | Purpose |
-|---|---|
-| [`umami`](umami/) | Reusable library — tokenization, signatures, profiles, detector |
-| [`umami-cli`](umami-cli/) | Binary `umami` — five subcommands: tokenize, pipeline, sim, ingest, load |
+## Build
 
----
-
-## How the algorithm works
-
-Log anomaly detection proceeds through four stages:
-
-```text
-raw line
-   │
-   ▼
-[1] Tokenize ──────────────────────────────────────────────────
-    Split the line into typed tokens:
-       Literal(0), Delimiter(1), Timestamp(2), Ipv4(3),
-       Quoted(4), Number(5), Json(6), JsonKey(7)
-
-   │
-   ▼
-[2] Structure signature ───────────────────────────────────────
-    Parameters: numbers, timestamps, IPs, and any word with a digit
-    or a '/' in it (web01, ids, paths, URLs). Everything else
-    except delimiters is structure.
-    Hash structure text + one placeholder per parameter with FNV-1a
-    → a stable 64-bit StructureHash. Lines differing only in their
-    parameter values hash identically.
-
-   │
-   ▼
-[3] Per-system Profile ────────────────────────────────────────
-    Look up (system, hash) in the ProfileStore.
-    Track: event count, first/last seen, values per parameter
-    slot (distinct, up to 100; past that the slot is ignored),
-    inter-arrival statistics (Welford mean/variance, z-score).
-
-   │
-   ▼
-[4] Classify ──────────────────────────────────────────────────
-    never_before_seen  — hash not in any system's store
-    new_in_system      — hash seen elsewhere, not here
-    parameter_change   — known structure, new parameter value
-    frequency_spike    — arrival rate >> learned baseline (z-score)
-    event_stop         — periodic structure silent > 3 intervals
-    system_away        — system silent > 10 minutes
-    (none)             — matches learned-normal → filtered out
-```
-
-### Tokenizers
-
-Two tokenizer variants are available:
-
-* **`structure`** (default): The modern structural tokenizer. Understands
-  `key=value` pairs (promoting the key to `JsonKey`), quoted strings, and
-  nested JSON contexts. Keys in `"key": value` JSON pairs are also promoted.
-* **`legacy`**: A whitespace-oriented tokenizer. Splits primarily on
-  whitespace, peels leading/trailing punctuation from each chunk, and recognizes
-  IPv4 addresses. ISO 8601 timestamps are not recognized (only syslog and CLF forms).
-
-Both tokenizers are checked against a 419-line golden corpus (`corpus/`): the
-structure tokenizer must match every line, and the legacy tokenizer every line
-except three listed in `umami/tests/corpus.rs`. The corpus records the
-tokenizers' own output, so it catches changes, not mistakes.
-
-### Accuracy
-
-Grouping accuracy on the [LogHub](https://github.com/logpai/loghub) 2k-line
-samples (16 datasets with hand-labelled templates; a line counts as correct
-when umami groups it with exactly the lines that share its template):
-
-| | structure tokenizer |
-|---|---|
-| mean over 16 datasets | 0.767 |
-| ≥ 0.95 | Apache, BGL, HDFS, Hadoop, HealthApp, Windows, Zookeeper |
-| < 0.5 | Linux 0.19, OpenSSH 0.39, Proxifier 0.001 |
-
-The weak datasets vary *words* inside a template (user names, hostnames):
-exact hashing can't merge those, a learned-wildcard parser such as Drain can.
-
----
-
-## Build and install
-
-**Requirements:** Rust 1.74 or later for the library, 1.85 or later for the CLI.
+The library supports Rust 1.74; the CLI and development tests require Rust 1.85 or later.
 
 ```sh
 git clone https://codeberg.org/gregburd/umami
 cd umami
-cargo build --release
-# Binary is at target/release/umami
+export CARGO_TARGET_DIR=/scratch/umami/build
+cargo build --release --locked
+cargo test --workspace --all-features --locked
 ```
 
-Run all tests (including golden corpus tests):
+The binary is /scratch/umami/build/release/umami.  Run cargo doc --no-deps to build API documentation.
 
-```sh
-cargo test --workspace
-```
-
-Run the criterion benchmarks:
-
-```sh
-cargo bench
-```
-
----
-
-## Library quick-start
-
-Add to `Cargo.toml`:
+For a sibling checkout, add this dependency to an application's Cargo.toml:
 
 ```toml
 [dependencies]
-umami = "0.1"
+umami = { package = "umami-log", path = "../umami/umami" }
 ```
 
-### Anomaly detection
+The crates.io package named umami belongs to an unrelated project.  These instructions use the
+source checkout and do not assume that umami-log has been published to crates.io.
+
+## Library
 
 ```rust
-use umami::{Detector, AnomalyKind};
+use umami::{AnomalyKind, Detector};
 
-let mut det = Detector::new();
+let mut detector = Detector::new();
+let first = detector.observe("web", "GET /health status 200", 0).unwrap();
+assert_eq!(first.kind, AnomalyKind::NeverBeforeSeen);
+assert!(detector.observe("web", "GET /health status 204", 1).is_none());
+assert!(detector.observe("web", "POST /health status 200", 2).is_some());
 
-// First time a structure is seen → NeverBeforeSeen
-let a = det.observe("web01", "GET /health status 200", 0).unwrap();
-assert_eq!(a.kind, AnomalyKind::NeverBeforeSeen);
-
-// Same structure, different dynamic value (200 vs 204) → filtered out
-let b = det.observe("web01", "GET /health status 204", 1);
-assert!(b.is_none());
-
-// Words with digits or slashes are dynamic too: paths, ids, hostnames
-assert!(det.observe("web01", "GET /users/42 status 200", 2).is_none()); // same shape as /health
-assert!(det.observe("web01", "POST /users/42 status 201", 3).is_some()); // new shape
-
-// Same structure on a new system → NewInSystem
-let c = det.observe("web02", "GET /health status 200", 4).unwrap();
-assert_eq!(c.kind, AnomalyKind::NewInSystem);
-
-// `now` is unix seconds. Call sweep() regularly to find silences:
-// web02 has been quiet for over 10 minutes.
-let found = det.sweep(4 + 601);
-assert!(found.iter().any(|a| a.system == "web02" && a.kind == AnomalyKind::SystemAway));
+let silence = detector.sweep(603);
+assert!(silence.iter().any(|a| a.kind == AnomalyKind::SystemAway));
 ```
 
-Use `umami::time::event_time(&tokens, now)` to take `now` from the line's own
-timestamp. With the `serde` feature, `ProfileStore` (from `Detector::store()`)
-can be saved and passed back to `Detector::with_store` to resume learning.
+Pass Unix seconds to observe(), or tokenize once and call observe_tokens().  Library callers
+must call sweep() periodically to detect silence.  The optional serde feature serializes
+ProfileStore; with_store() resumes it.  Callers own the choice and validation of their clock.
 
-### Direct tokenization
+### Structures
 
-```rust
-use umami::{tokenize, TokenType};
+The tokenizer recognizes timestamps, IPv4 addresses, numbers, quoted text, JSON keys, and
+key=value pairs.  It retokenizes quoted message contents rather than hiding an entire message
+inside one parameter.
 
-let tokens = tokenize("Jan 23 10:23:45 web01 sshd[1234]: Accepted from 10.0.0.1");
-assert_eq!(tokens[0].ty, TokenType::Timestamp);   // "Jan 23 10:23:45"
-assert!(tokens.iter().any(|t| t.ty == TokenType::Number && t.text == "1234"));
+Signatures retain fixed words and a placeholder for every parameter position.  Changing a
+number does not change the signature; moving a parameter between words does.  Digits, paths,
+URLs, email addresses, long hex identifiers, and dotted host:port values receive variable
+handling.  These rules are heuristics: alphabetic names can still create separate structures.
 
-// Key/value promotion
-let kv = tokenize("duration=3.14 status=ok");
-assert_eq!(kv[0].ty, TokenType::JsonKey);  // "duration" → key
-assert_eq!(kv[2].ty, TokenType::Number);   // "3.14" → number
-assert_eq!(kv[4].ty, TokenType::JsonKey);  // "status" → key
-assert_eq!(kv[6].ty, TokenType::Literal);  // "ok" → literal (not a number)
-```
+Exact signatures use a 64-bit FNV-1a hash.  They do not learn wildcard templates.  Hashes are
+not cryptographic identifiers, and this release changes some hashes from version 0.1.
 
-### Structure signatures
+### Alerts and learning
 
-```rust
-use umami::{tokenize, signature::{structure_signature, structure_string}};
+| Kind | Meaning |
+| --- | --- |
+| never_before_seen | Structure not seen on any system. |
+| new_in_system | Structure known elsewhere, first seen on this system. |
+| frequency_spike | Current minute count exceeds the learned completed-minute baseline. |
+| parameter_change | A stable parameter slot receives a new value.  Opt-in. |
+| event_stop | A sufficiently regular event stream goes silent. |
+| system_away | No event from a system for ten minutes by default. |
 
-let a = structure_signature(&tokenize("request id=1 took 3 ms"));
-let b = structure_signature(&tokenize("request id=999 took 7 ms"));
-assert_eq!(a, b);  // dynamic values don't affect the hash
+Frequency detection waits for thirty completed minute buckets.  It compares the current count
+with the historical mean, using a variance floor of max(variance, mean, 1).  The default
+threshold is 3.  A spike reports the rate increase at its first threshold crossing; it does
+not grade the eventual flood size or estimate an incident probability.  Empty minutes
+contribute to learning without an iteration per missing minute.
 
-let s = structure_string(&tokenize("Jan 23 10:23:45 sshd failed root 22"));
-// Timestamps and numbers become <*>; literals remain:
-assert_eq!(s, "<*> sshd failed root <*>");
-```
+Stop detection requires at least twenty intervals with standard deviation no greater than
+one fifth of their mean.  Silence must exceed three mean intervals by default.  Return gaps
+contribute to learning, so an outage can delay renewed eligibility for stop alerts.  Stop and
+spike alerts have separate rolling 24-hour cooldowns per system and structure.  An uninterrupted
+silence remains one episode rather than generating daily reminders.
 
----
+Parameter tracking allocates no trackers when disabled.  When enabled, it excludes timestamp
+tokens and requires twenty preceding observations with at most one distinct value per ten
+observations.  Slots exceeding 100 distinct values become permanently free-form.  Changed-slot
+ordinals include timestamp positions, even though those positions do not generate changes.
 
-## CLI usage
+Out-of-order events do not move last_seen backward or train timing statistics.  They can still
+contribute structural and parameter learning.  Profiles do not expire automatically.
 
-```text
-umami <SUBCOMMAND> [OPTIONS] [ARGS...]
-```
-
-### `tokenize` — inspect tokenization
+## CLI
 
 ```sh
-# Tokenize one line (default: structure tokenizer, test printer)
-umami tokenize "Jan 23 10:23:45 web01 sshd[1234]: ok"
+# Inspect parameters and fixed text.
+umami tokenize --pretty static 'request id=42 took 3 ms'
+umami tokenize --pretty params 'request id=42 took 3 ms'
 
-# Show which tokens are parameters (dynamic values)
-umami tokenize --pretty params "Jan 23 10:23:45 web01 sshd[1234]: ok"
+# Filter, summarize, or produce one JSON object per anomaly.
+umami pipeline < syslog
+umami sim < syslog
+umami ingest < syslog
 
-# Use the legacy tokenizer, colorized
-umami tokenize --tokenizer legacy --pretty colors --color "Jan 23 10:23:45 web01"
-
-# Read from stdin
-journalctl -n 100 | umami tokenize --pretty static
-
-# Run against a golden test file; report mismatches
-umami tokenize --test corpus/structure.tsv
-
-# Fix mismatches in-place
-umami tokenize --test corpus/structure.tsv --fix
-```
-
-**Options:**
-
-| Flag | Default | Description |
-|---|---|---|
-| `--tokenizer structure\|legacy` | `structure` | Tokenizer variant |
-| `--pretty test\|colors\|params\|delimiters\|static` | `test` | Output format |
-| `--color` | off | ANSI colorize (colors printer only) |
-| `--test FILE` | — | Run golden test file |
-| `--fix` | off | Rewrite test file with current output |
-| `--verbose` | off | Print passing cases too |
-
-Pretty-printer formats:
-
-* `test` — `T{text}` tokens joined by spaces
-* `colors` — original line with ANSI token-type coloring
-* `params` — original line + `^~~~` markers under each parameter
-* `delimiters` — original line + `^` markers under each delimiter
-* `static` — the structure signature: structural tokens joined by spaces,
-  `<*>` for each parameter
-
----
-
-### `pipeline` — filter a log stream
-
-Reads lines from stdin as they arrive, runs them through the detector, and
-prints only anomalous lines (or all lines with `--show-all`).
-
-```sh
-# Filter a log file, show only anomalous lines
-cat syslog | umami pipeline --system web01
-
-# Show all lines with their classification
-cat syslog | umami pipeline --system web01 --show-all
-
-# Also detect parameter changes (new values on known structures)
-cat syslog | umami pipeline --parameters
-
-# Follow the journal, keeping what was learned between runs
+# Retain learning across runs.
 journalctl -f | umami pipeline --state ~/.cache/umami.json
+
+# Opt into stable-parameter changes.
+umami ingest --parameters < syslog
+
+# Each input line carries system<TAB>message.
+umami ingest --tagged < tagged.log
 ```
 
-**Options** (`pipeline`, `sim` and `ingest` share all but `--show-all`):
+pipeline prints anomaly kind followed by the original event.  --show-all also prints normal
+events with the kind ok.  Stop and away alerts have no source line and identify the system and
+structure instead.  sim prints aggregate counts and the proportion of input events suppressed;
+synthetic sweep alerts do not count as input events.  ingest provides JSON fields for system,
+kind, score, hash, signature, original line, and changed parameter slots.
 
-| Flag | Default | Description |
-|---|---|---|
-| `--system NAME` | `stdin` | System name attributed to events |
-| `--tagged` | off | Read lines as `system<TAB>logline` |
-| `--tokenizer structure\|legacy` | `structure` | Tokenizer variant |
-| `--parameters` | off | Emit parameter-change anomalies |
-| `--state FILE` | — | Load learned profiles from FILE, save them back |
-| `--show-all` | off | Print every line with its classification |
+load runs a throughput probe, using four synthetic templates by default.  Use --stdin for a
+real stream and --count to change the synthetic event count.  This measures filtering speed,
+not incident-detection quality.
 
-Each anomalous output line is prefixed with the kind (e.g. `never_before_seen`),
-padded to 18 characters, followed by the original line. `event_stop` and
-`system_away` have no line; they print `[system]` and the signature.
+## Time, input, and state
 
-Detection runs on *event time*: each line is observed at its own timestamp
-(ISO 8601, CLF or syslog), so replaying an old log reports the silences in it.
-Silences are checked once per minute of event time. `--state` files record
-the tokenizer and refuse to load under a different one.
+Automatic timestamp recognition supports ISO, Apache CLF, and syslog headers.  Yearless syslog
+input assumes substantially chronological order: initial inference uses the reference date,
+then continuing inference recognizes forward movement and New Year rollover.  Arbitrarily
+reordered yearless logs are ambiguous; supply explicit years for those replays.  Zone-less
+timestamps use UTC.
 
----
+Use --time-format with a strftime-style format for other header layouts.  The format must
+supply a year, date, and time.  Its consumed prefix becomes a timestamp token, so changing its
+value does not create a new structure.  Explicit format mismatches and timestamps beyond the
+permitted real-future allowance fail rather than silently advancing learned time.
 
-### `sim` — summarize anomaly counts
+Use --multiline to join indented continuation lines to their preceding event.  It is opt-in;
+default input remains one event per line.  The first physical line supplies the event time.
+Assembly flushes at EOF or after a one-second idle interval and caps an event at 1 MiB.
+Slow continuations can therefore become separate events.  --multiline and --tagged cannot be
+combined in this version.
 
-Like `pipeline` but consumes the entire stream and prints a summary table rather
-than individual lines.
+A state file belongs to one writer for the duration of a run.  Saving uses a unique temporary
+file in the same directory followed by atomic replacement.  Invalid or incompatible state
+fails without resetting or overwriting the learned data.  Keep state in a trusted directory.
+Version 0.1 state cannot be reused because tokenization and detector state have changed;
+retain the old file and choose a new state path to relearn.
+
+## Reference fixtures and tests
+
+umami is an independent detector, not a compatible implementation of unomalycli.  The original
+419-line reference captures remain under umami/corpus/reference with provenance.  Independent
+regression expectations live in umami/corpus/structure.tsv.  Never regenerate the reference
+captures to make a changed tokenizer pass.
 
 ```sh
-cat syslog | umami sim --system web01
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+umami tokenize --test umami/corpus/structure.tsv
 ```
 
-Example output (50k lines of a desktop journal):
-```text
-events:    50000
-anomalies: 222
-reduction: 99.6%
-profiles:  210
-  event_stop         9
-  frequency_spike    12
-  never_before_seen  210
-```
+Review intentional expectation changes individually.  The tokenize --fix option rewrites its
+input file; use it only on a copy of a regression fixture, never the reference captures.
 
-**Options:** as for `pipeline`, without `--show-all`.
+## Measurement limits
 
----
+The November 14 audit measured grouping accuracy 0.767 across sixteen LogHub 2k samples for the
+pre-release tokenizer.  It missed ten true templates on first appearance.  On one workstation
+journal, that build processed 7.8 million lines in about twenty seconds and 10 MB of peak RSS,
+but still produced hundreds of alerts per day after initial learning.
 
-### `ingest` — structured JSON output
-
-Emits one JSON object per anomalous event, suitable for piping to a log aggregator
-or storage system.
-
-```sh
-# Single system
-cat syslog | umami ingest --system web01
-
-# Multi-system: input lines are "system<TAB>logline"
-paste -d'\t' <(echo -e "web01\nweb02") <(echo -e "disk full on /dev/sda1\ndisk full on /dev/sdb1") \
-  | umami ingest --tagged
-```
-
-Each output line is a JSON object. `hash` identifies the structure (`null`
-for `system_away`) and is the field to deduplicate on:
-```json
-{"system":"web01","kind":"never_before_seen","score":1.00,"hash":"96a870bdc586e53c","signature":"disk full on <*>","line":"disk full on /dev/sda1"}
-{"system":"web02","kind":"new_in_system","score":0.80,"hash":"96a870bdc586e53c","signature":"disk full on <*>","line":"disk full on /dev/sdb1"}
-```
-
-**Options:** as for `pipeline`, without `--show-all`.
-
----
-
-### `load` — throughput benchmark
-
-Measures how fast the detector processes events. By default it generates
-synthetic lines from four templates, so the run measures steady-state
-filtering.
-
-```sh
-# Benchmark with 1M synthetic events
-umami load
-
-# Benchmark with 500k events
-umami load --count 500000
-
-# Benchmark against real data from stdin
-cat syslog | umami load --stdin
-```
-
-Example output:
-```text
-processed 1000000 events in 1.008s
-throughput 992461 events/sec
-anomalies  4
-profiles   4
-```
-
-**Options:** `--count N` (default 1 000 000), `--tokenizer`, `--stdin`.
-
----
-
-## Corpus / golden tests
-
-The `corpus/` directory contains TSV files used as golden test fixtures:
-
-| File | Tokenizer | Lines |
-|---|---|---|
-| `corpus/inputs.txt` | — | Raw input lines (shared) |
-| `corpus/structure.tsv` | `structure` | `input<TAB>expected` pairs |
-| `corpus/legacy.tsv` | `legacy` | `input<TAB>expected` pairs |
-
-The `expected` column is the `test` pretty-printer output (`T{text}` format).
-The integration test in `umami/tests/corpus.rs` requires the structure
-tokenizer to match every line, and the legacy tokenizer every line except the
-three listed in that test (nested JSON, a bare date, empty quoted values).
-
-After an intended tokenizer change, review the diff and regenerate:
-
-```sh
-umami tokenize --test corpus/structure.tsv --fix
-umami tokenize --tokenizer legacy --test corpus/legacy.tsv --fix
-git diff corpus/
-```
-
----
-
-## Performance
-
-Measured on an EC2 c7i.2xlarge (Sapphire Rapids), `cargo bench`:
-
-| Benchmark | Throughput |
-|---|---|
-| `tokenize/structure` (6 mixed formats) | 82 MiB/s |
-| `tokenize/legacy` | 95 MiB/s |
-| `detect/observe_10k` (tokenize + hash + profile + classify) | 1.04 M events/s |
-
-On an 856k-line, 3-day desktop journal, `umami sim` runs in 2.8 s with a
-peak RSS of 18 MB, keeping 10,557 profiles (98.7% of lines filtered).
-
----
+Those historical measurements do not qualify version 0.2.0.  A local rerun of the integrated
+0.2.0 tokenizer measured mean grouping accuracy 0.798 on the same sixteen message-body samples,
+with 1,655 first-structure alerts and ten first-template misses.  Whole raw lines scored 0.694,
+with 1,903 first-structure alerts and eight misses.  Header preprocessing changes the result.
+Grouping accuracy is not incident precision or recall, and a high filtering percentage alone
+does not establish useful alerts.
 
 ## License
 
-Licensed under either of:
-
-* Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
-  <http://www.apache.org/licenses/LICENSE-2.0>)
-* MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
-
-at your option.
+Dual-licensed under Apache-2.0 or MIT, at your option.  See LICENSE-APACHE and LICENSE-MIT.

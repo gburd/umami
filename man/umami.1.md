@@ -1,10 +1,10 @@
-% UMAMI(1) umami 0.1.0 | User Commands
+% UMAMI(1) umami 0.2.0 | User Commands
 % umami contributors
-% 2024
+% 2026
 
 # NAME
 
-umami — log anomaly detection and structural tokenization
+umami - filter repetitive log events by structure
 
 # SYNOPSIS
 
@@ -12,266 +12,146 @@ umami — log anomaly detection and structural tokenization
 
 # DESCRIPTION
 
-**umami** learns the *structure* of streaming log events and surfaces only the
-new, changed, and anomalous lines, filtering out repetitive, already-seen traffic.
+umami groups events by fixed words and parameter positions.  It reports new structures,
+unusual minute counts, stable-parameter changes, and silence.  A previously learned error
+can recur without an alert; use explicit rules for known failures.
 
-The detection pipeline has four stages:
-
-1. **Tokenize** — split each line into typed tokens (literals, delimiters,
-   timestamps, IP addresses, quoted strings, numbers, JSON keys).
-2. **Structure signature** — hash the static tokens (literals and keys), plus a
-   placeholder for each dynamic value, with FNV-1a into a stable 64-bit
-   fingerprint. Dynamic values are numbers, timestamps, IPs, and any word that
-   contains a digit or a **/** (hostnames like *web01*, ids, paths, URLs).
-   Lines that differ only in dynamic values share the same signature.
-3. **Profile** — look up the (system, signature) pair in the store.
-   Track event counts, first/last seen times, the values seen in each
-   parameter slot (up to 100 distinct values; past that the slot is treated
-   as free-form and ignored), and inter-arrival statistics.
-4. **Classify** — compare the new event against the learned profile and emit an
-   anomaly kind, or suppress the event if it matches normal behavior.
-
-Anomaly kinds:
-
-**never_before_seen**
-:   The structure has not been seen on any system.
-
-**new_in_system**
-:   The structure has been seen on other systems but not this one.
-
-**parameter_change**
-:   The structure is known but a dynamic parameter has a new value.
-
-**frequency_spike**
-:   Events are arriving significantly faster than the learned baseline
-    (graded small, medium, or large by z-score magnitude).
-
-**event_stop**
-:   A structure that arrives at a steady rate has been silent for more than
-    three of its mean intervals. Reported once, until it is seen again.
-
-**system_away**
-:   A system has sent nothing for ten minutes. Reported once, until it sends
-    again.
-
-**pipeline**, **sim** and **ingest** run the detector on *event time*: each
-line is observed at its own timestamp (ISO 8601, Apache CLF, or syslog; a
-syslog timestamp's year is inferred), and a line without one at the latest
-timestamp seen so far. Silences are looked for once per minute of event time,
-and each system is judged on its own clock, so with **--tagged** a system
-whose timestamps lag the others' is not reported for the lag.
-Replaying an old log therefore reports the stops and absences it contains.
-Input is processed line by line, so these commands work on live streams
-(**tail -f**, **journalctl -f**); invalid UTF-8 is replaced, not fatal.
+The independent tokenizer recognizes timestamps, numbers, IP addresses, quoted contents,
+JSON keys, and key=value pairs.  Variable-looking text includes digits, paths, URLs, email
+addresses, long hexadecimal identifiers, and dotted host:port values.  Exact signatures
+retain parameter positions.  The Legacy tokenizer and compatibility claim have been removed.
 
 # SUBCOMMANDS
 
 ## tokenize
 
-**umami tokenize** [**--tokenizer** *NAME*] [**--pretty** *STYLE*] [**--color**]
+**umami tokenize** [**--pretty** *STYLE*] [**--color**]
 [**--test** *FILE* [**--fix**] [**--verbose**]] [*LINE*...]
 
-Tokenize one or more log lines and print the result.  If no *LINE* arguments
-are given, lines are read from standard input.
+Inspect arguments or standard input.  Styles are **test**, **colors**, **params**,
+**delimiters**, and **static**.  The default test style renders typed tokens; static
+renders fixed text with **<*>** for parameters.  Use --color with colors for ANSI output.
 
-**--tokenizer** *structure*|*legacy*
-:   Select the tokenizer variant.
-    **structure** (default) — the modern tokenizer that understands
-    **key=value** pairs (promoting the key to a **JsonKey** token), quoted
-    strings, and JSON key/value contexts.
-    **legacy** — the original whitespace-oriented tokenizer; splits on
-    whitespace, peels leading/trailing punctuation, and recognizes IPv4
-    addresses. Does not detect ISO 8601 timestamps.
+--test reads input/expected TSV pairs.  --verbose also prints passing cases.
+--fix rewrites expectations in the supplied file.  Never use it on original reference
+captures; review changes on a copy of an independent regression fixture instead.
 
-**--pretty** *test*|*colors*|*params*|*delimiters*|*static*
-:   Output format (default: **test**).
-    **test** — reference format: **T{text}** tokens joined by spaces, where T
-    is the numeric token type (0=literal, 1=delimiter, 2=timestamp, …).
-    **colors** — original line text with ANSI color highlighting per token type
-    (use with **--color** to activate).
-    **params** — original line followed by a **\^\~\~\~** marker row marking
-    each dynamic (parameter) token.
-    **delimiters** — original line followed by a **\^** marker row marking
-    each delimiter.
-    **static** — the structure signature: structural tokens joined by spaces,
-    with **<\*>** for each parameter.
-
-**--color**
-:   Enable ANSI coloring (only meaningful with **--pretty colors**).
-
-**--test** *FILE*
-:   Run a golden test file instead of tokenizing input. The file format is TSV:
-    *input*\t*expected*, where expected is the **test**-format output. Failures
-    are printed to standard output.
-
-**--fix**
-:   When used with **--test**, rewrite the file with the tokenizer's current
-    output, updating any mismatched expected values in-place.
-
-**--verbose**
-:   With **--test**, also print passing cases.
-
-### Examples
-
-    # Tokenize a single line
-    umami tokenize "Jan 23 10:23:45 web01 sshd[1234]: ok"
-
-    # Show dynamic-parameter positions
-    umami tokenize --pretty params "level=info duration=3.14 status=ok"
-
-    # Colorized output
-    umami tokenize --pretty colors --color "disk full on /dev/sda1"
-
-    # Read from stdin; show only structural tokens
-    journalctl -n 500 | umami tokenize --pretty static
-
-    # Check a corpus file
-    umami tokenize --test corpus/structure.tsv
+    umami tokenize --pretty static 'request id=42 took 3 ms'
+    umami tokenize --test umami/corpus/structure.tsv
 
 ## pipeline
 
 **umami pipeline** [*DETECT OPTIONS*] [**--show-all**]
 
-Read log lines from standard input, run each through the detector, and print
-anomalous lines to standard output. Each output line is prefixed with the anomaly
-kind padded to 18 characters, then the original line. **event_stop** and
-**system_away**, which have no line, print **[***system***]** and the
-signature instead.
-
-Without **--show-all**, normal (non-anomalous) lines are suppressed.
-
-### Detect options
-
-These apply to **pipeline**, **sim** and **ingest**.
-
-**--system** *NAME*
-:   Attribute events to this system name (default: **stdin**).
-
-**--tagged**
-:   Treat each input line as *system*\t*logline*, so several systems can be
-    multiplexed on one stream. Lines without a tab are attributed to
-    **--system**.
-
-**--tokenizer** *structure*|*legacy*
-:   Tokenizer variant (default: **structure**).
-
-**--parameters**
-:   Also emit **parameter_change** anomalies when a known structure receives a
-    previously-unseen parameter value.
-
-**--state** *FILE*
-:   Load learned profiles from *FILE* if it exists, and save them back at the
-    end of input and at most once a minute while input is idle, so learning
-    carries over between runs. The file is replaced atomically (via
-    *FILE***.tmp**), and is created before input is read, so an unwritable
-    path fails at once. A file saved with a different **--tokenizer**, or by
-    an incompatible version, is an error. A state learned from timestamped
-    input resumes its clock, so a replay's untimed first line is not judged
-    against the wall clock; one learned from untimed input keeps using the
-    wall clock.
-
-### Pipeline options
-
-**--show-all**
-:   Print every line; prefix normal lines with **ok** instead of suppressing them.
-
-### Examples
-
-    cat /var/log/syslog | umami pipeline --system web01
-
-    # Show all lines annotated
-    cat syslog | umami pipeline --show-all
-
-    # Detect parameter changes too
-    cat access.log | umami pipeline --parameters
-
-    # Follow the journal, remembering what was learned last time
-    journalctl -f | umami pipeline --state ~/.cache/umami.json
+Print each anomaly kind followed by its original event.  With --show-all, print normal
+events as **ok**.  Synthetic stop and away alerts print the system and structure instead
+of a source line.  A multiline event retains embedded newlines.
 
 ## sim
 
 **umami sim** [*DETECT OPTIONS*]
 
-Consume all of standard input and print a summary of anomaly counts, total event
-count, and the noise-reduction percentage (fraction of lines filtered as
-normal). Takes the detect options described under **pipeline**.
-
-### Example
-
-    cat /var/log/syslog | umami sim --system prod-web01
-
-    events:    50000
-    anomalies: 222
-    reduction: 99.6%
-    profiles:  210
-      event_stop         9
-      frequency_spike    12
-      never_before_seen  210
+Print event count, anomaly count, suppression percentage, profile count, and counts by
+kind.  Synthetic sweep alerts do not count as input events.  In multiline mode, events
+are assembled messages rather than physical lines.
 
 ## ingest
 
 **umami ingest** [*DETECT OPTIONS*]
 
-Read log lines from standard input and emit one JSON object per anomaly to
-standard output (newline-delimited JSON).  Each JSON object has the fields:
-**system**, **kind**, **score** (float 0–1), **hash** (the 16-hex-digit
-structure hash, or **null** for **system_away**), **signature** (the
-structure, with **<\*>** for each parameter), **line** (original log line;
-empty for **event_stop** and **system_away**). Takes the detect options
-described under **pipeline**.
-
-### Examples
-
-    cat /var/log/syslog | umami ingest --system web01 | jq .
-
-    # Multi-system input
-    paste -d'\t' systems.txt lines.txt | umami ingest --tagged
-
-    # Example output line
-    {"system":"web01","kind":"never_before_seen","score":1.00,
-     "hash":"96a870bdc586e53c","signature":"disk full on <*>",
-     "line":"disk full on /dev/sda1"}
+Print one JSON object per anomaly, with **system**, **kind**, **score**, **hash**,
+**signature**, **line**, and **changed_params**.  The hash is null for system-away events;
+stop and away events have empty source lines.  Changed parameters use zero-based dynamic
+slot ordinals, including positions occupied by excluded timestamps.  Scores are fixed
+values by kind, not probabilities.
 
 ## load
 
-**umami load** [**--count** *N*] [**--tokenizer** *NAME*] [**--stdin**]
+**umami load** [**--count** *N*] [**--stdin**]
 
-Throughput benchmark. By default generates *N* synthetic log lines from four
-templates and measures how fast the detector filters them. With **--stdin**,
-reads from standard input instead.
+Run a throughput probe.  Default input contains one million synthetic events from four
+templates; --stdin reads actual input.  This measures filtering speed, not detection quality.
 
-**--count** *N*
-:   Number of synthetic events to generate (default: **1000000**).
+# DETECT OPTIONS
 
-**--tokenizer** *structure*|*legacy*
-:   Tokenizer variant (default: **structure**).
+The following apply to pipeline, sim, and ingest.
 
-**--stdin**
-:   Read lines from standard input instead of generating synthetic data.
+**--system** *NAME*
+:   Attribute untagged input to this system (default: stdin).
 
-### Example
+**--tagged**
+:   Read system, tab, and message per physical line.  A line without a tab uses --system.
+    Cannot be combined with --multiline.
 
-    umami load
-    umami load --count 500000
-    cat big.log | umami load --stdin
+**--parameters**
+:   Report new values in stable parameter slots.  Requires twenty preceding observations
+    and at most one distinct value per ten observations.  Timestamp tokens are excluded;
+    slots exceeding 100 distinct values become permanently free-form.  Without this option,
+    no parameter-value tracking occurs.
 
-# EXIT STATUS
+**--multiline**
+:   Join indented continuations to the preceding event.  Flush at EOF or after one second
+    without input.  Events are limited to 1 MiB; exceeding the bound fails instead of silently
+    dropping content.  Late continuations can form separate events.  Only the first physical
+    line supplies the timestamp.
 
-**0**
-:   Success.
+**--time-format** *FORMAT*
+:   Parse a leading strftime-style timestamp with an explicit year, date, and time.
+    Numeric offsets are supported; zone-less input uses UTC.  The parsed prefix becomes a
+    timestamp token.  Invalid formats or mismatching input fail rather than falling back
+    silently to automatic recognition.
 
-**1**
-:   An error occurred (bad argument, I/O error, unreadable **--state** file,
-    test failure). A closed output pipe (**| head**) is not an error.
+**--state** *FILE*
+:   Resume learned profiles and save accepted learning on completion, interruption, and
+    periodic checkpoints.  A lifetime lock excludes another writer.  Atomic replacement
+    uses a unique temporary file in the same directory.  Incompatible settings, malformed
+    state, and old format versions fail without replacing existing state.  Keep the file
+    in a trusted directory.  Version 0.1 state requires relearning under a new path.
+
+# TIME AND ALERTS
+
+Automatic recognition supports ISO, Apache CLF, and syslog headers.  Yearless syslog input
+assumes substantially chronological order, with a separate initial reference-date rule and
+continuing New Year inference.  Arbitrary reordering without years remains ambiguous.
+Timestamped replay does not advance just because real time passes.  Untimed input uses wall
+time until event-time history supplies an anchor.
+
+Timestamps more than one day ahead of real time fail before changing learned state.  This
+allowance does not make zone-less timestamps timezone-aware.
+
+Frequency detection waits for thirty completed minute buckets.  Its threshold compares
+current count to the historical mean with a variance floor.  A frequency_spike reports the
+first crossing, not the eventual size of a flood.
+
+Event-stop detection requires twenty regular intervals, a standard deviation no greater
+than one fifth of the mean, and silence beyond three mean intervals.  Return gaps train the
+baseline.  Stop and spike alerts have independent rolling 24-hour cooldowns.  Continuous
+silence is one episode.  System-away defaults to ten minutes of absence.
+
+# SHUTDOWN AND INPUT
+
+Invalid UTF-8 is replaced.  SIGINT and SIGTERM request a checkpoint of accepted learning.
+A blocked output pipe must not prevent saving; shutdown may discard queued output that
+cannot drain.  SIGKILL and power loss cannot trigger a final save, so they can lose learning
+since the last checkpoint.  Neither a checkpoint nor input buffering guarantees downstream
+delivery of every emitted alert.
+
+# EXAMPLES
+
+    umami pipeline --system web < syslog
+    journalctl -f | umami pipeline --state ~/.cache/umami.json
+    umami ingest --parameters < syslog
+    umami ingest --multiline < stacktraces.log
+    umami sim --time-format '%Y/%m/%d %H:%M:%S' < custom.log
 
 # FILES
 
-**corpus/structure.tsv**, **corpus/legacy.tsv**
-:   Golden test corpora in *input*\t*expected* TSV format, used by the
-    integration tests.
+**umami/corpus/structure.tsv**
+:   Independent tokenizer regression expectations.
+
+**umami/corpus/reference/**
+:   Original unomalycli reference captures, retained for provenance rather than rewritten.
 
 # SEE ALSO
 
-**umami**(3)
-
-Crate documentation: run **cargo doc --open -p umami** in the workspace.
+**umami**(3), command help, and the repository README.
