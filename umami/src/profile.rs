@@ -6,7 +6,7 @@
 //! frequency statistics used to detect spikes.
 
 use crate::signature::StructureHash;
-use crate::token::Token;
+use crate::token::{Token, TokenType};
 use std::collections::{HashMap, HashSet};
 
 /// The maximum number of distinct values tracked per dynamic parameter
@@ -29,11 +29,22 @@ pub struct RunningStats {
 impl RunningStats {
     /// Adds a sample to the accumulator.
     pub fn push(&mut self, x: f64) {
-        self.count += 1;
+        self.count = self.count.saturating_add(1);
         let delta = x - self.mean;
         self.mean += delta / self.count as f64;
         let delta2 = x - self.mean;
         self.m2 += delta * delta2;
+    }
+
+    /// Merges `count` zero samples without iterating over empty minutes.
+    fn push_zeros(&mut self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let total = self.count.saturating_add(count);
+        self.m2 += self.mean * self.mean * self.count as f64 * count as f64 / total as f64;
+        self.mean *= self.count as f64 / total as f64;
+        self.count = total;
     }
 
     /// Population variance, or `0.0` if fewer than two samples.
@@ -78,18 +89,20 @@ pub struct ParamTracker {
 }
 
 impl ParamTracker {
-    /// Records a parameter value, returning `true` if it had not been seen
-    /// before (a parameter-change signal). Once more than
+    /// Records a value, signaling a new value only after twenty preceding
+    /// observations with at most one distinct value per ten observations.
+    /// Once more than
     /// [`MAX_PARAM_VALUES`] distinct values have been seen the parameter is
     /// treated as free-form (an id, a counter) and never signals again.
     pub fn observe(&mut self, value: &str) -> bool {
-        self.total += 1;
+        let stable = self.total >= 20 && self.values.len() as u64 <= self.total / 10;
+        self.total = self.total.saturating_add(1);
         if self.saturated || self.values.iter().any(|v| v == value) {
             return false;
         }
         if self.values.len() < MAX_PARAM_VALUES {
             self.values.push(value.to_string());
-            true
+            stable
         } else {
             self.saturated = true;
             self.values = Vec::new(); // free the memory; the set is meaningless now
@@ -114,6 +127,46 @@ impl ParamTracker {
     }
 }
 
+/// Completed-minute baseline and the currently accumulating minute.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+struct MinuteRate {
+    minute: Option<i64>,
+    count: u64,
+    stats: RunningStats,
+    reported: bool,
+}
+
+impl MinuteRate {
+    /// Counts an arrival against preceding completed minutes, ignoring old buckets.
+    fn observe(&mut self, now: i64) -> Option<f64> {
+        let minute = now.div_euclid(60);
+        if let Some(previous) = self.minute {
+            if minute < previous {
+                return None;
+            }
+            if minute > previous {
+                self.stats.push(self.count as f64);
+                self.stats.push_zeros((minute - previous - 1) as u64);
+                self.count = 0;
+                self.reported = false;
+            }
+        }
+        self.minute = Some(minute);
+        self.count = self.count.saturating_add(1);
+        if self.stats.count < 30 {
+            return None;
+        }
+        let variance = self.stats.variance().max(self.stats.mean).max(1.0);
+        Some((self.count as f64 - self.stats.mean) / variance.sqrt())
+    }
+}
+
+/// Tests a rolling day without overflowing at either timestamp boundary.
+fn cooldown_elapsed(last: Option<i64>, now: i64) -> bool {
+    last.map_or(true, |last| now.saturating_sub(last) >= 86_400)
+}
+
 /// A learned profile for one log-line structure on one system.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -131,11 +184,17 @@ pub struct Profile {
     /// Per-parameter value trackers, keyed by parameter index within the line.
     pub params: HashMap<usize, ParamTracker>,
     /// Inter-arrival time statistics (seconds between consecutive events),
-    /// used to detect frequency spikes and stops.
+    /// used to determine periodicity and detect stops.
     pub interval_stats: RunningStats,
     /// Set by [`crate::Detector::sweep`] once this profile's silence has been
     /// reported, until it is seen again.
     pub(crate) stop_reported: bool,
+    #[cfg_attr(feature = "serde", serde(default))]
+    rate: MinuteRate,
+    #[cfg_attr(feature = "serde", serde(default))]
+    last_stop: Option<i64>,
+    #[cfg_attr(feature = "serde", serde(default))]
+    last_spike: Option<i64>,
 }
 
 impl Profile {
@@ -150,15 +209,59 @@ impl Profile {
             params: HashMap::new(),
             interval_stats: RunningStats::default(),
             stop_reported: false,
+            rate: MinuteRate::default(),
+            last_stop: None,
+            last_spike: None,
         }
     }
 
-    /// Whether the structure arrives at a steady rate: at least 3 intervals,
-    /// with a standard deviation under half their mean. Only periodic
+    /// Whether the structure arrives at a steady rate: at least twenty intervals,
+    /// with a standard deviation at most one fifth of their mean.  Only periodic
     /// profiles are reported as [stopped](crate::AnomalyKind::EventStop).
     pub fn is_periodic(&self) -> bool {
         let s = &self.interval_stats;
-        s.count >= 3 && s.mean > 0.0 && s.stddev() < 0.5 * s.mean
+        s.count >= 20 && s.mean > 0.0 && s.stddev() <= 0.2 * s.mean
+    }
+
+    /// Learns nonnegative intervals, including return gaps, and minute counts.
+    pub(crate) fn observe_time(&mut self, now: i64) -> Option<f64> {
+        let mut z = None;
+        if now >= self.last_seen {
+            if self.count > 0 {
+                self.interval_stats
+                    .push(now.saturating_sub(self.last_seen) as f64);
+            }
+            z = self.rate.observe(now);
+            if now > self.last_seen {
+                self.last_seen = now;
+                self.stop_reported = false;
+            }
+        }
+        self.count = self.count.saturating_add(1);
+        z
+    }
+
+    /// Latches a spike for this minute and applies its independent daily cooldown.
+    pub(crate) fn report_spike(&mut self, now: i64) -> bool {
+        if self.rate.reported {
+            return false;
+        }
+        self.rate.reported = true;
+        if !cooldown_elapsed(self.last_spike, now) {
+            return false;
+        }
+        self.last_spike = Some(now);
+        true
+    }
+
+    /// Latches a silence even when its independent daily cooldown suppresses it.
+    pub(crate) fn report_stop(&mut self, now: i64) -> bool {
+        self.stop_reported = true;
+        if !cooldown_elapsed(self.last_stop, now) {
+            return false;
+        }
+        self.last_stop = Some(now);
+        true
     }
 
     /// Average inter-arrival interval in seconds, if known.
@@ -279,13 +382,15 @@ impl ProfileStore {
 /// Extracts the `(slot, value)` pairs of dynamic parameter tokens from a
 /// tokenized line, where `slot` is the parameter's ordinal (0 for the first
 /// parameter). Lines sharing a [`StructureHash`] have the same slots, so a
-/// slot names the same field across every line of a profile.
+/// slot names the same field across every line of a profile.  Timestamp tokens
+/// consume an ordinal but are excluded from the returned values.
 pub fn parameter_values(tokens: &[Token]) -> Vec<(usize, &str)> {
     tokens
         .iter()
         .filter(|t| t.is_parameter())
-        .map(|t| t.text.as_str())
         .enumerate()
+        .filter(|(_, t)| t.ty != TokenType::Timestamp)
+        .map(|(slot, t)| (slot, t.text.as_str()))
         .collect()
 }
 
@@ -308,13 +413,63 @@ mod tests {
     }
 
     #[test]
+    fn skipped_minutes_match_explicit_zero_samples() {
+        let mut rate = MinuteRate::default();
+        rate.observe(-60);
+        rate.observe(-59);
+        rate.observe(1800);
+        let mut expected = RunningStats::default();
+        expected.push(2.0);
+        for _ in 0..30 {
+            expected.push(0.0);
+        }
+        assert_eq!(rate.stats.count, expected.count);
+        assert!((rate.stats.mean - expected.mean).abs() < 1e-12);
+        assert!((rate.stats.m2 - expected.m2).abs() < 1e-12);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn new_private_fields_default_when_loading_old_profiles() {
+        let profile = Profile::new(StructureHash(1), "request".into(), 0);
+        let mut value = serde_json::to_value(&profile).unwrap();
+        let object = value.as_object_mut().unwrap();
+        for field in ["rate", "last_stop", "last_spike"] {
+            object.remove(field);
+        }
+        let restored: Profile = serde_json::from_value(value).unwrap();
+        assert_eq!(profile, restored);
+    }
+
+    #[test]
     fn param_tracker_caps() {
         let mut p = ParamTracker::default();
         let new = (0..150).filter(|i| p.observe(&i.to_string())).count();
-        assert_eq!(new, MAX_PARAM_VALUES); // no signal past the cap
+        assert_eq!(new, 0); // Free-form values never become stable.
         assert!(p.is_saturated());
         assert!(!p.observe("0"));
         assert_eq!(p.total, 151);
+    }
+
+    #[test]
+    fn timestamp_exclusion_preserves_dynamic_ordinals() {
+        let tokens = [
+            Token::new(TokenType::Timestamp, "now"),
+            Token::literal("status"),
+            Token::new(TokenType::Number, "200"),
+        ];
+        assert_eq!(parameter_values(&tokens), vec![(1, "200")]);
+    }
+
+    #[test]
+    fn parameter_learning_uses_preceding_observations() {
+        let mut tracker = ParamTracker::default();
+        for _ in 0..19 {
+            assert!(!tracker.observe("200"));
+        }
+        assert!(!tracker.observe("201"));
+        assert!(tracker.observe("500"));
+        assert!(!tracker.observe("501"));
     }
 
     #[test]

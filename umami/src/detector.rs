@@ -9,8 +9,8 @@
 //! * **New in system** — a structure new to this system but seen elsewhere.
 //! * **Parameter change** — a known structure with a previously unseen value
 //!   in one of its dynamic parameters.
-//! * **Frequency spike** — a known structure arriving far faster than its
-//!   learned inter-arrival rate (graded small/medium/large by z-score).
+//! * **Frequency spike**: a minute count above the learned completed-minute
+//!   baseline (graded small/medium/large by z-score).
 //! * **Event stop** — a periodic structure that has gone silent.
 //! * **System away** — a system that has stopped sending data entirely.
 //!
@@ -82,6 +82,9 @@ pub struct Anomaly {
     pub line: String,
     /// A score in `[0, 1]` indicating how significant the anomaly is.
     pub score: f64,
+    /// Dynamic parameter ordinals whose values changed after stable learning.
+    /// Timestamp tokens consume an ordinal but never appear here.
+    pub changed_params: Vec<usize>,
 }
 
 /// Tunable thresholds controlling detection sensitivity.
@@ -92,9 +95,11 @@ pub struct DetectorConfig {
     pub tokenizer: Tokenizer,
     /// Number of occurrences of a structure before its baseline is trusted:
     /// frequency spikes and parameter changes are only reported once a
-    /// profile has been seen this many times.
+    /// profile has been seen this many times.  Minute-count and stable-parameter
+    /// learning impose their own additional minimums.
     pub learn_threshold: u64,
-    /// z-score above which a faster-than-usual arrival is a small spike.
+    /// z-score above which a minute count is a small spike, after thirty
+    /// completed minutes.  Variance has a floor of the mean or one.
     pub spike_small: f64,
     /// z-score for a medium spike.
     pub spike_medium: f64,
@@ -232,47 +237,26 @@ impl Detector {
         }
         let (profile, _created) = self.store.get_or_insert(system, hash, tokens, now);
         let learned = !profile.is_newish(cfg.learn_threshold);
-        let stop_after = cfg.stop_factor * profile.interval_stats.mean;
-
-        // Update frequency stats from the inter-arrival interval. Skip a line
-        // older than the last one (no interval), and a gap that sweep()
-        // reported as a stop (an outage, not the rhythm).
-        let gap = now - profile.last_seen;
-        let outage = profile.stop_reported && gap as f64 > stop_after;
-        let mut spike: Option<SpikeMagnitude> = None;
-        if profile.count > 0 && gap >= 0 && !outage {
-            let interval = gap as f64;
-            let z = profile.interval_stats.zscore(interval);
-            // A spike = arrivals *faster* than usual => interval well *below*
-            // the mean => strongly negative z-score.
-            let neg = -z;
-            spike = if !learned {
+        let z = profile.observe_time(now);
+        let spike = z.and_then(|z| {
+            if !learned || z < cfg.spike_small || !profile.report_spike(now) {
                 None
-            } else if neg >= cfg.spike_large {
+            } else if z >= cfg.spike_large {
                 Some(SpikeMagnitude::Large)
-            } else if neg >= cfg.spike_medium {
+            } else if z >= cfg.spike_medium {
                 Some(SpikeMagnitude::Medium)
-            } else if neg >= cfg.spike_small {
-                Some(SpikeMagnitude::Small)
             } else {
-                None
-            };
-            profile.interval_stats.push(interval);
-        }
-
-        // Update parameter trackers; record whether any value was new.
-        let mut param_changed = false;
-        for (idx, value) in parameter_values(tokens) {
-            let tracker = profile.params.entry(idx).or_default();
-            if tracker.observe(value) && learned {
-                param_changed = true;
+                Some(SpikeMagnitude::Small)
             }
-        }
+        });
 
-        profile.count += 1;
-        if now > profile.last_seen {
-            profile.last_seen = now;
-            profile.stop_reported = false; // heard from again: re-arm
+        let mut changed_params = Vec::new();
+        if cfg.detect_parameter_changes {
+            for (idx, value) in parameter_values(tokens) {
+                if profile.params.entry(idx).or_default().observe(value) && learned {
+                    changed_params.push(idx);
+                }
+            }
         }
 
         let signature = if structural_kind.is_some() {
@@ -286,7 +270,7 @@ impl Detector {
             Some(k)
         } else if let Some(mag) = spike {
             Some(AnomalyKind::FrequencySpike(mag))
-        } else if param_changed && cfg.detect_parameter_changes {
+        } else if !changed_params.is_empty() {
             Some(AnomalyKind::ParameterChange)
         } else {
             None
@@ -299,6 +283,7 @@ impl Detector {
             signature,
             line: line.to_string(),
             score: score_for(kind),
+            changed_params,
         })
     }
 
@@ -306,7 +291,8 @@ impl Detector {
     /// ordered by system, each system's stopped events before its absence.
     /// Call it regularly (say once a minute of event time); each silence is
     /// reported once, until the structure or system sends a line newer than
-    /// its last one.
+    /// its last one.  Stops also have a rolling 86400-second cooldown per
+    /// profile, independent of the frequency-spike cooldown.
     ///
     /// * An [`AnomalyKind::EventStop`] is reported for a periodic profile
     ///   (see [`crate::Profile::is_periodic`]) silent for more than
@@ -338,8 +324,8 @@ impl Detector {
                 if !profile.stop_reported
                     && profile.is_periodic()
                     && silent > cfg.stop_factor * profile.interval_stats.mean
+                    && profile.report_stop(now)
                 {
-                    profile.stop_reported = true;
                     out.push(Anomaly {
                         system: system.clone(),
                         kind: AnomalyKind::EventStop,
@@ -347,6 +333,7 @@ impl Detector {
                         signature: profile.signature.clone(),
                         line: String::new(),
                         score: score_for(AnomalyKind::EventStop),
+                        changed_params: Vec::new(),
                     });
                 }
             }
@@ -360,6 +347,7 @@ impl Detector {
                     signature: String::new(),
                     line: String::new(),
                     score: score_for(AnomalyKind::SystemAway),
+                    changed_params: Vec::new(),
                 });
             }
         }
@@ -417,80 +405,247 @@ mod tests {
     }
 
     #[test]
-    fn parameter_change_detected() {
+    fn parameter_changes_require_stable_learning() {
         let mut cfg = DetectorConfig::default();
         cfg.detect_parameter_changes = true;
         let mut d = Detector::with_config(cfg);
-        // establish the profile with one value
-        d.observe("h", "temp reading 42C", 0);
-        // new numeric value on an established profile -> parameter change
-        let a = d.observe("h", "temp reading 99C", 1);
-        assert!(matches!(
-            a.map(|x| x.kind),
-            Some(AnomalyKind::ParameterChange)
-        ));
+        for i in 0..20 {
+            assert_eq!(
+                d.observe("h", "temp reading 42C", i).map(|a| a.kind),
+                (i == 0).then_some(AnomalyKind::NeverBeforeSeen)
+            );
+        }
+        let anomaly = d.observe("h", "temp reading 99C", 20).unwrap();
+        assert_eq!(anomaly.kind, AnomalyKind::ParameterChange);
+        assert_eq!(anomaly.changed_params, [0]);
     }
 
     #[test]
-    fn learn_threshold_delays_parameter_changes() {
+    fn timestamp_and_id_noise_stays_quiet() {
         let mut cfg = DetectorConfig::default();
         cfg.detect_parameter_changes = true;
-        cfg.learn_threshold = 3;
         let mut d = Detector::with_config(cfg);
-        let kinds: Vec<_> = (0..5)
-            .map(|i| d.observe("h", &format!("temp {i}"), i).map(|a| a.kind))
-            .collect();
-        use AnomalyKind::*;
-        assert_eq!(
-            kinds,
-            [
-                Some(NeverBeforeSeen),
-                None,
-                None,
-                Some(ParameterChange),
-                Some(ParameterChange)
-            ]
-        );
+        for i in 0..100 {
+            let tokens = [
+                Token::new(crate::TokenType::Timestamp, i.to_string()),
+                Token::literal("request"),
+                Token::new(crate::TokenType::Number, i.to_string()),
+            ];
+            assert_eq!(
+                d.observe_tokens("h", "", &tokens, i).map(|a| a.kind),
+                (i == 0).then_some(AnomalyKind::NeverBeforeSeen)
+            );
+        }
     }
 
     #[test]
-    fn spike_on_early_arrival_of_periodic_event() {
+    fn changed_slots_include_timestamp_ordinals() {
+        let mut cfg = DetectorConfig::default();
+        cfg.detect_parameter_changes = true;
+        cfg.learn_threshold = 21;
+        let mut d = Detector::with_config(cfg);
+        for i in 0..=21 {
+            let tokens = [
+                Token::new(crate::TokenType::Timestamp, i.to_string()),
+                Token::new(crate::TokenType::Number, if i < 20 { "200" } else { "500" }),
+                Token::new(crate::TokenType::Number, if i < 21 { "1" } else { "2" }),
+            ];
+            let anomaly = d.observe_tokens("h", "", &tokens, i);
+            if i == 21 {
+                assert_eq!(anomaly.unwrap().changed_params, [2]);
+            } else if i > 0 {
+                assert_eq!(anomaly, None);
+            }
+        }
+        let profile = d
+            .store()
+            .iter_systems()
+            .next()
+            .unwrap()
+            .1
+            .values()
+            .next()
+            .unwrap();
+        assert!(!profile.params.contains_key(&0));
+    }
+
+    #[test]
+    fn default_detection_does_not_track_parameters() {
+        let mut d = Detector::new();
+        let a = d.observe("h", "request id=42", 0).unwrap();
+        assert!(d
+            .store()
+            .get("h", a.hash.unwrap())
+            .unwrap()
+            .params
+            .is_empty());
+    }
+
+    #[test]
+    fn jittered_heartbeat_is_not_a_flood() {
         let mut d = Detector::new();
         let mut t = 0;
-        for i in 0..20 {
-            t += 60 + i % 2; // every 60-61 s
+        for i in 0..40 {
+            t += 60 + i % 2;
             assert_eq!(
                 d.observe("h", "heartbeat ok", t).map(|a| a.kind),
                 (i == 0).then_some(AnomalyKind::NeverBeforeSeen)
             );
         }
-        let a = d.observe("h", "heartbeat ok", t + 1).unwrap();
-        assert_eq!(a.kind, AnomalyKind::FrequencySpike(SpikeMagnitude::Large));
+        assert_eq!(d.observe("h", "heartbeat ok", t + 1), None);
     }
 
     #[test]
-    fn sweep_reports_each_silence_once() {
+    fn irregular_arrivals_still_detect_a_same_second_flood() {
         let mut d = Detector::new();
-        for i in 0..10 {
-            d.observe("h", "heartbeat ok", i * 60);
+        for minute in 0..30 {
+            d.observe("h", "request", minute * 60);
+            d.observe("h", "request", minute * 60 + 1);
         }
-        d.observe("h", "something else", 540);
-        assert!(d.sweep(600).is_empty());
-        let kinds = |v: Vec<Anomaly>| v.into_iter().map(|a| a.kind).collect::<Vec<_>>();
-        // 3 mean intervals (180 s) of silence -> the heartbeat stopped
-        assert_eq!(kinds(d.sweep(800)), [AnomalyKind::EventStop]);
-        assert!(d.sweep(900).is_empty());
-        // 600 s with nothing at all -> the system is away
-        assert_eq!(kinds(d.sweep(1200)), [AnomalyKind::SystemAway]);
-        assert!(d.sweep(1300).is_empty());
-        // it comes back, then stops again: both are reported again
-        for i in 0..3 {
-            d.observe("h", "heartbeat ok", 1300 + i * 60);
+        let alerts: Vec<_> = (0..100)
+            .filter_map(|_| d.observe("h", "request", 1800))
+            .collect();
+        assert_eq!(alerts.len(), 1);
+        assert!(matches!(alerts[0].kind, AnomalyKind::FrequencySpike(_)));
+    }
+
+    #[test]
+    fn zero_threshold_does_not_bypass_warmup_or_admit_late_events() {
+        let mut cfg = DetectorConfig::default();
+        cfg.spike_small = 0.0;
+        let mut d = Detector::with_config(cfg);
+        for t in (0..1800).step_by(60) {
+            assert_eq!(
+                d.observe("h", "request", t).map(|a| a.kind),
+                (t == 0).then_some(AnomalyKind::NeverBeforeSeen)
+            );
         }
-        assert_eq!(
-            kinds(d.sweep(3000)),
-            [AnomalyKind::EventStop, AnomalyKind::SystemAway]
-        );
+        assert!(matches!(
+            d.observe("h", "request", 1800).unwrap().kind,
+            AnomalyKind::FrequencySpike(_)
+        ));
+        // A fresh profile has no cooldown to hide accidental late-event alerts.
+        cfg.learn_threshold = 100;
+        let mut d = Detector::with_config(cfg);
+        for t in (0..6000).step_by(60) {
+            d.observe("h", "request", t);
+        }
+        assert!(d.observe("h", "request", 0).is_none());
+    }
+
+    #[test]
+    fn minute_warmup_includes_skipped_zero_buckets() {
+        let mut d = Detector::new();
+        d.observe("h", "request", 0);
+        for _ in 0..100 {
+            assert_eq!(d.observe("h", "request", 1740), None);
+        }
+        let alerts: Vec<_> = (0..100)
+            .filter_map(|_| d.observe("h", "request", 1800))
+            .collect();
+        assert_eq!(alerts.len(), 1);
+    }
+
+    #[test]
+    fn stop_requires_twenty_regular_intervals() {
+        let mut d = Detector::new();
+        for i in 0..20 {
+            d.observe("h", "heartbeat", i * 60);
+        }
+        assert!(d.sweep(1400).is_empty());
+        d.observe("h", "heartbeat", 1200);
+        assert_eq!(d.sweep(1601)[0].kind, AnomalyKind::EventStop);
+    }
+
+    #[test]
+    fn jitter_above_twenty_percent_does_not_stop() {
+        let mut d = Detector::new();
+        let mut t = 0;
+        for i in 0..40 {
+            t += if i % 2 == 0 { 40 } else { 80 };
+            d.observe("h", "heartbeat", t);
+        }
+        assert!(d.sweep(t + 300).is_empty());
+    }
+
+    #[test]
+    fn extreme_timestamps_do_not_overflow() {
+        let mut d = Detector::new();
+        d.observe("h", "request", i64::MIN);
+        d.observe("h", "request", i64::MAX);
+        d.observe("h", "request", i64::MIN);
+        d.sweep(i64::MAX);
+        let hash = structure_signature(&crate::tokenize("request"));
+        let p = d.store().get("h", hash).unwrap();
+        assert_eq!(p.interval_stats.count, 1);
+        assert_eq!(p.interval_stats.mean, i64::MAX as f64);
+    }
+
+    #[test]
+    fn stop_cooldown_is_rolling_and_silence_is_one_episode() {
+        let mut cfg = DetectorConfig::default();
+        cfg.away_secs = i64::MAX;
+        cfg.stop_factor = 0.5;
+        let mut d = Detector::with_config(cfg);
+        for i in 0..=20 {
+            d.observe("a", "heartbeat", i * 60);
+            d.observe("b", "heartbeat", i * 60);
+        }
+        assert_eq!(d.sweep(1231).len(), 2);
+        d.observe("a", "heartbeat", 1260);
+        assert!(d.sweep(1291).is_empty());
+        assert!(d.sweep(87631).is_empty());
+        // Keep normal arrivals while the cooldown expires, then stop again.
+        let mut d = Detector::with_config(cfg);
+        for t in (0..=87600).step_by(60) {
+            d.observe("a", "heartbeat", t);
+            if t == 1200 {
+                assert_eq!(d.sweep(1231).len(), 1);
+            }
+            if t == 87540 {
+                assert!(d.sweep(87571).is_empty());
+            }
+        }
+        assert_eq!(d.sweep(87631)[0].kind, AnomalyKind::EventStop);
+    }
+
+    #[test]
+    fn spike_cooldowns_are_independent_of_system_profile_and_stop() {
+        let mut cfg = DetectorConfig::default();
+        cfg.stop_factor = 0.5;
+        let mut d = Detector::with_config(cfg);
+        for t in (0..=1800).step_by(60) {
+            d.observe("a", "heartbeat", t);
+            d.observe("b", "heartbeat", t);
+            d.observe("a", "request", t);
+        }
+        assert_eq!(d.sweep(1831).len(), 3);
+        for (system, line) in [("a", "heartbeat"), ("b", "heartbeat"), ("a", "request")] {
+            let alerts: Vec<_> = (0..10)
+                .filter_map(|_| d.observe(system, line, 1832))
+                .collect();
+            assert_eq!(alerts.len(), 1);
+            assert!(matches!(alerts[0].kind, AnomalyKind::FrequencySpike(_)));
+        }
+    }
+
+    #[test]
+    fn late_flood_does_not_change_current_rate() {
+        let mut d = Detector::new();
+        for t in (0..1800).step_by(60) {
+            d.observe("h", "request", t);
+        }
+        assert!(d.observe("h", "request", 1810).is_none());
+        for _ in 0..100 {
+            assert!(d.observe("h", "request", 1809).is_none());
+        }
+        for _ in 0..2 {
+            assert!(d.observe("h", "request", 1810).is_none());
+        }
+        assert!(matches!(
+            d.observe("h", "request", 1810).map(|a| a.kind),
+            Some(AnomalyKind::FrequencySpike(_))
+        ));
     }
 
     /// Two systems on `period`-second rhythms, `b` running `lag` seconds
@@ -552,28 +707,22 @@ mod tests {
     }
 
     #[test]
-    fn late_lines_do_not_rearm_or_skew_intervals() {
+    fn late_lines_do_not_rearm_and_return_gaps_are_learned() {
         let mut d = Detector::new();
-        for i in 0..10 {
+        for i in 0..21 {
             d.observe("h", "heartbeat ok", i * 60);
         }
-        assert_eq!(d.sweep(1200).len(), 2); // stop + away
-        d.observe("h", "heartbeat ok", 120); // a straggler from the past
-        assert!(d.sweep(1260).is_empty());
+        assert_eq!(d.sweep(1900).len(), 2);
+        d.observe("h", "heartbeat ok", 120);
+        assert!(d.sweep(1960).is_empty());
         let hb = structure_signature(&crate::tokenize("heartbeat ok"));
-        assert_eq!(d.store().get("h", hb).unwrap().interval_stats.count, 9);
-        // genuinely back; the 760 s outage is not learned as an interval
-        d.observe("h", "heartbeat ok", 1300);
-        assert_eq!(d.store().get("h", hb).unwrap().interval_stats.mean, 60.0);
-        assert!(d.sweep(1310).is_empty());
-        for i in 1..5 {
-            d.observe("h", "heartbeat ok", 1300 + i * 60);
-        }
-        // stops again: reported again
-        assert!(d
-            .sweep(2000)
-            .iter()
-            .any(|a| a.kind == AnomalyKind::EventStop));
+        assert_eq!(d.store().get("h", hb).unwrap().interval_stats.count, 20);
+        d.observe("h", "heartbeat ok", 2000);
+        let profile = d.store().get("h", hb).unwrap();
+        assert_eq!(profile.interval_stats.count, 21);
+        assert!(profile.interval_stats.mean > 90.0);
+        assert!(!profile.is_periodic());
+        assert!(d.sweep(2300).is_empty());
     }
 
     #[test]
@@ -596,15 +745,15 @@ mod serde_tests {
     #[test]
     fn learned_state_survives_a_round_trip() {
         let mut d = Detector::new();
-        for i in 0..10 {
+        for i in 0..21 {
             d.observe("h", &format!("heartbeat {i} ok"), i * 60);
         }
         let json = serde_json::to_string(d.store()).unwrap();
         let store: ProfileStore = serde_json::from_str(&json).unwrap();
         let mut d = Detector::with_store(DetectorConfig::default(), store);
-        assert_eq!(d.observe("h", "heartbeat 99 ok", 600), None);
+        assert_eq!(d.observe("h", "heartbeat 99 ok", 1260), None);
         assert_eq!(
-            d.observe("other", "heartbeat 1 ok", 600).map(|a| a.kind),
+            d.observe("other", "heartbeat 1 ok", 1260).map(|a| a.kind),
             Some(AnomalyKind::NewInSystem)
         );
         // the learned rhythm came back too
@@ -627,5 +776,65 @@ mod serde_tests {
         let store: ProfileStore = serde_json::from_str(&json).unwrap();
         let mut d = Detector::with_store(DetectorConfig::default(), store);
         assert!(d.sweep(2100).is_empty());
+    }
+
+    #[test]
+    fn partial_minute_and_spike_cooldown_survive_restart() {
+        let mut d = Detector::new();
+        for t in (0..1800).step_by(60) {
+            d.observe("h", "request", t);
+        }
+        for _ in 0..3 {
+            assert!(d.observe("h", "request", 1800).is_none());
+        }
+        let json = serde_json::to_string(d.store()).unwrap();
+        let mut d = Detector::with_store(
+            DetectorConfig::default(),
+            serde_json::from_str(&json).unwrap(),
+        );
+        assert!(matches!(
+            d.observe("h", "request", 1800).unwrap().kind,
+            AnomalyKind::FrequencySpike(_)
+        ));
+        let json = serde_json::to_string(d.store()).unwrap();
+        let mut d = Detector::with_store(
+            DetectorConfig::default(),
+            serde_json::from_str(&json).unwrap(),
+        );
+        for _ in 0..20 {
+            assert!(d.observe("h", "request", 1800).is_none());
+            assert!(d.observe("h", "request", 1860).is_none());
+        }
+        for minute in 32..1470 {
+            d.observe("h", "request", minute * 60);
+        }
+        for _ in 0..10 {
+            assert!(d.observe("h", "request", 88199).is_none());
+        }
+        let alerts: Vec<_> = (0..30)
+            .filter_map(|_| d.observe("h", "request", 88200))
+            .collect();
+        assert_eq!(alerts.len(), 1);
+    }
+
+    #[test]
+    fn stop_cooldown_and_parameter_learning_survive_restart() {
+        let cfg = DetectorConfig {
+            stop_factor: 0.5,
+            detect_parameter_changes: true,
+            ..DetectorConfig::default()
+        };
+        let mut d = Detector::with_config(cfg);
+        for t in (0..=1200).step_by(60) {
+            d.observe("h", "status 200", t);
+        }
+        assert_eq!(d.sweep(1231)[0].kind, AnomalyKind::EventStop);
+        let json = serde_json::to_string(d.store()).unwrap();
+        let mut d = Detector::with_store(cfg, serde_json::from_str(&json).unwrap());
+        assert_eq!(
+            d.observe("h", "status 500", 1260).unwrap().changed_params,
+            [0]
+        );
+        assert!(d.sweep(1291).is_empty());
     }
 }
