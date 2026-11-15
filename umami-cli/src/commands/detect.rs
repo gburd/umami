@@ -5,17 +5,24 @@ use clap::Args as ClapArgs;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use umami::{
-    time::event_time, Anomaly, AnomalyKind, Detector, DetectorConfig, ProfileStore, Tokenizer,
+    time::{continuing_event_time, event_time},
+    Anomaly, AnomalyKind, Detector, DetectorConfig, ProfileStore, Tokenizer,
 };
 
 /// How often, in seconds of event time, to look for silent events and systems.
 const SWEEP_EVERY: i64 = 60;
 
-/// Bump when a change to tokenizing or hashing makes saved profiles invalid.
-const STATE_FORMAT: u64 = 1;
+mod input;
+mod output;
+mod state;
+mod timestamp;
 
 /// Options shared by `pipeline`, `sim` and `ingest`.
 #[derive(ClapArgs)]
@@ -29,6 +36,14 @@ pub struct Args {
     #[arg(long)]
     tagged: bool,
 
+    /// Join indented continuation lines (1 MiB limit, one-second idle flush).
+    #[arg(long, conflicts_with = "tagged")]
+    multiline: bool,
+
+    /// Parse a leading strftime timestamp with an explicit year (zone defaults to UTC).
+    #[arg(long, value_name = "FORMAT")]
+    time_format: Option<String>,
+
     /// Tokenizer to use.
     #[arg(long, default_value = "structure", value_parser = super::tokenizer_arg())]
     tokenizer: Tokenizer,
@@ -37,8 +52,7 @@ pub struct Args {
     #[arg(long)]
     parameters: bool,
 
-    /// Load learned profiles from FILE if it exists, and save them back at
-    /// the end of input (and every minute or so while input is idle).
+    /// Lock and resume FILE; checkpoint every minute, on EOF, and on SIGINT/SIGTERM.
     #[arg(long, value_name = "FILE")]
     state: Option<PathBuf>,
 }
@@ -74,118 +88,202 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<(), Box<dyn Error>> {
     run(args.common, Format::Text { show_all })
 }
 
-/// Runs a detection subcommand over stdin.
+/// Runs detection with bounded IO and main-thread checkpoint ownership.
 ///
-/// Each line is observed at its own timestamp (see [`umami::time`]); a line
-/// without one is observed at the latest timestamp seen (including any in a
-/// loaded `--state`), or the wall clock before any. Every [`SWEEP_EVERY`]
-/// seconds of that clock the detector is swept for stopped events and silent
-/// systems.
-//
-// shortcut: sweeps only run when a line arrives, so a stream that goes fully
-// idle reports system_away when it resumes, not while idle. Read stdin on a
-// thread and sweep on a timer if live idle alerts are needed.
+/// A signal saves accepted learning and exits even if stdout cannot drain.
+/// Queued output may then be lost.  Idle input does not advance event time.
 pub fn run(args: Args, format: Format) -> Result<(), Box<dyn Error>> {
+    let parsed_format = args
+        .time_format
+        .as_deref()
+        .map(timestamp::TimestampFormat::new)
+        .transpose()?;
+    let shutdown = Arc::new(AtomicBool::new(false));
+    for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+        signal_hook::flag::register(signal, shutdown.clone())?;
+    }
     let mut cfg = DetectorConfig::default();
     cfg.tokenizer = args.tokenizer;
     cfg.detect_parameter_changes = args.parameters;
-    let (store, event_clock) = match &args.state {
-        Some(path) if path.exists() => load_state(path, cfg.tokenizer)?,
-        Some(path) => {
-            // fail now, not after the whole stream
-            save_state(path, &Detector::with_config(cfg), false)?;
-            (ProfileStore::new(), false)
-        }
-        None => (ProfileStore::new(), false),
+    let settings = state::Settings {
+        tokenizer: args.tokenizer.name().into(),
+        multiline: args.multiline,
+        time_format: args.time_format.clone(),
+        tagged: args.tagged,
+        system: args.system.clone(),
+        parameters: args.parameters,
     };
-    let mut det = Detector::with_store(cfg, store);
-    let mut saved_at = Instant::now();
+    let state = args
+        .state
+        .as_ref()
+        .map(|path| state::State::open(path, settings))
+        .transpose()?;
+    let (store, anchors) = match &state {
+        Some(state) => state.load()?,
+        None => (ProfileStore::new(), BTreeMap::new()),
+    };
+    let mut session = Session {
+        det: Detector::with_store(cfg, store),
+        anchors,
+        state,
+        dirty: false,
+        saved_at: Instant::now(),
+        shutdown,
+        next_sweep: i64::MIN,
+        counts: BTreeMap::new(),
+        events: 0,
+        flagged: 0,
+    };
+    let mut input = input::Input::stdin(args.multiline);
+    let output = output::Output::stdout();
+    let result = (|| -> Result<(), Box<dyn Error>> {
+        loop {
+            if session.tick()? {
+                break;
+            }
+            match input.next()? {
+                input::InputEvent::Event(line) => {
+                    let bytes = session.observe(&args, format, parsed_format.as_ref(), &line)?;
+                    output.send(bytes, || session.tick())?;
+                }
+                input::InputEvent::Wake => {}
+                input::InputEvent::Eof => break,
+            }
+        }
+        if matches!(format, Format::Summary) {
+            output.send(session.summary()?, || session.tick())?;
+        }
+        Ok(())
+    })();
+    session.save()?;
+    result?;
+    output.finish(|| session.tick())?;
+    Ok(())
+}
 
-    let mut out = io::BufWriter::new(io::stdout().lock());
-    let mut counts: BTreeMap<&'static str, u64> = BTreeMap::new();
-    let (mut events, mut flagged) = (0u64, 0u64);
-    // A state learned on event time resumes its clock, so a replay's untimed
-    // first line is not stamped "now" against old profiles; one learned on
-    // the wall clock (untimed input) keeps using the wall clock.
-    let mut clock: Option<i64> = det.clock().filter(|_| event_clock);
-    let mut next_sweep = i64::MIN;
+struct Session {
+    det: Detector,
+    anchors: BTreeMap<String, i64>,
+    state: Option<state::State>,
+    dirty: bool,
+    saved_at: Instant,
+    shutdown: Arc<AtomicBool>,
+    next_sweep: i64,
+    counts: BTreeMap<&'static str, u64>,
+    events: u64,
+    flagged: u64,
+}
 
-    let result = super::for_each_line(io::stdin().lock(), |raw, more| {
+impl Session {
+    /// Validates time before either sweeping or observing can mutate learning.
+    fn observe(
+        &mut self,
+        args: &Args,
+        format: Format,
+        parsed_format: Option<&timestamp::TimestampFormat>,
+        raw: &str,
+    ) -> Result<Vec<u8>, Box<dyn Error>> {
         let (system, line) = match raw.split_once('\t') {
             Some((s, l)) if args.tagged => (s, l),
             _ => (args.system.as_str(), raw),
         };
-        let tokens = cfg.tokenizer.tokenize(line);
-        // Only parsed timestamps move the clock; a line without one is seen at
-        // the latest time so far, or the wall clock if there has been none.
-        let parsed = event_time(&tokens, clock.unwrap_or_else(wall_clock));
-        if let Some(t) = parsed {
-            if clock.is_none() {
-                next_sweep = i64::MIN; // switching from the wall clock to event time
-            }
-            clock = Some(clock.map_or(t, |c| c.max(t)));
+        let (tokens, parsed) = if let Some(parser) = parsed_format {
+            let (tokens, time) = parser.tokenize(line, args.tokenizer)?;
+            (tokens, Some(time))
+        } else {
+            let tokens = args.tokenizer.tokenize(line);
+            let header = args
+                .tokenizer
+                .tokenize(line.split('\n').next().unwrap_or(line));
+            let parsed = match self.anchors.get(system) {
+                Some(&previous) => continuing_event_time(&header, previous),
+                None => event_time(&header, wall_clock()),
+            };
+            (tokens, parsed)
+        };
+        if parsed.is_some_and(|t| t > wall_clock().saturating_add(86_400)) {
+            return Err("future timestamp exceeds wall clock plus one day".into());
         }
-        let latest = clock.unwrap_or_else(wall_clock);
-        let now = parsed.unwrap_or(latest);
-
-        if latest >= next_sweep {
-            for a in det.sweep(latest) {
-                flagged += 1;
-                *counts.entry(a.kind.as_str()).or_default() += 1;
-                print(&mut out, format, &a)?;
+        if let Some(time) = parsed {
+            if self.anchors.is_empty() {
+                self.next_sweep = i64::MIN;
             }
-            next_sweep = latest + SWEEP_EVERY;
+            self.anchors
+                .entry(system.to_string())
+                .and_modify(|t| *t = (*t).max(time))
+                .or_insert(time);
         }
-
-        events += 1;
-        match det.observe_tokens(system, line, &tokens, now) {
-            Some(a) => {
-                flagged += 1;
-                *counts.entry(a.kind.as_str()).or_default() += 1;
-                print(&mut out, format, &a)?;
+        let latest = self
+            .anchors
+            .values()
+            .copied()
+            .max()
+            .unwrap_or_else(wall_clock);
+        let now = parsed
+            .or_else(|| self.anchors.get(system).copied())
+            .unwrap_or(latest);
+        let mut out = Vec::new();
+        self.dirty = true;
+        if latest >= self.next_sweep {
+            for anomaly in self.det.sweep(latest) {
+                self.report(&mut out, format, &anomaly)?;
             }
+            self.next_sweep = latest.saturating_add(SWEEP_EVERY);
+        }
+        self.events += 1;
+        match self.det.observe_tokens(system, line, &tokens, now) {
+            Some(anomaly) => self.report(&mut out, format, &anomaly)?,
             None if matches!(format, Format::Text { show_all: true }) => {
                 writeln!(out, "{:<18} {line}", "ok")?;
             }
             None => {}
         }
-        if !more {
-            out.flush()?;
-            if let Some(path) = &args.state {
-                if saved_at.elapsed().as_secs() >= 60 {
-                    save_state(path, &det, clock.is_some())?;
-                    saved_at = Instant::now();
-                }
-            }
-        }
-        Ok(())
-    });
-
-    // Save even when output failed (`| head` closing the pipe), so learning
-    // is not lost; then report the output error.
-    if let Some(path) = &args.state {
-        save_state(path, &det, clock.is_some())?;
+        Ok(out)
     }
-    result?;
 
-    if let Format::Summary = format {
-        writeln!(out, "events:    {events}")?;
-        writeln!(out, "anomalies: {flagged}")?;
-        // sweep anomalies have no line, so they do not count against lines
-        let flagged_lines = flagged - counts_of_sweeps(&counts);
-        let reduction = if events > 0 {
-            100.0 * (1.0 - flagged_lines as f64 / events as f64)
+    fn report(&mut self, out: &mut Vec<u8>, format: Format, anomaly: &Anomaly) -> io::Result<()> {
+        self.flagged += 1;
+        *self.counts.entry(anomaly.kind.as_str()).or_default() += 1;
+        print(out, format, anomaly)
+    }
+
+    /// Uses monotonic deadlines and runs even under continuous input or blocked output.
+    fn tick(&mut self) -> io::Result<bool> {
+        let stop = self.shutdown.load(Ordering::Relaxed);
+        if stop || self.saved_at.elapsed().as_secs() >= 60 {
+            self.save()?;
+        }
+        Ok(stop)
+    }
+
+    fn save(&mut self) -> io::Result<()> {
+        if self.dirty {
+            if let Some(state) = &self.state {
+                state.save(&self.det, &self.anchors)?;
+            }
+            self.dirty = false;
+        }
+        self.saved_at = Instant::now();
+        Ok(())
+    }
+
+    fn summary(&self) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        writeln!(out, "events:    {}", self.events)?;
+        writeln!(out, "anomalies: {}", self.flagged)?;
+        let flagged_lines = self.flagged - counts_of_sweeps(&self.counts);
+        let reduction = if self.events > 0 {
+            100.0 * (1.0 - flagged_lines as f64 / self.events as f64)
         } else {
             0.0
         };
         writeln!(out, "reduction: {reduction:.1}%")?;
-        writeln!(out, "profiles:  {}", det.store().profile_count())?;
-        for (kind, n) in counts {
+        writeln!(out, "profiles:  {}", self.det.store().profile_count())?;
+        for (kind, n) in &self.counts {
             writeln!(out, "  {kind:<18} {n}")?;
         }
+        Ok(out)
     }
-    out.flush()?;
-    Ok(())
 }
 
 fn wall_clock() -> i64 {
@@ -201,57 +299,6 @@ fn counts_of_sweeps(counts: &BTreeMap<&'static str, u64>) -> u64 {
         .sum()
 }
 
-/// Loads a state file: the store, and whether its times are event times.
-fn load_state(path: &Path, tokenizer: Tokenizer) -> Result<(ProfileStore, bool), Box<dyn Error>> {
-    let fail = |why: String| format!("{}: {why}", path.display());
-    let mut v: serde_json::Value = std::fs::File::open(path)
-        .map_err(|e| fail(e.to_string()))
-        .and_then(|f| {
-            serde_json::from_reader(io::BufReader::new(f)).map_err(|e| fail(e.to_string()))
-        })?;
-    if v["format"] != STATE_FORMAT {
-        return Err(fail(format!(
-            "state format {} is not {STATE_FORMAT}",
-            v["format"]
-        ))
-        .into());
-    }
-    if v["tokenizer"] != tokenizer.name() {
-        let msg = format!(
-            "saved with --tokenizer {}, not {}",
-            v["tokenizer"],
-            tokenizer.name()
-        );
-        return Err(fail(msg).into());
-    }
-    let event_clock = v["clock"] != "wall";
-    let store = serde_json::from_value(v["store"].take()).map_err(|e| fail(e.to_string()))?;
-    Ok((store, event_clock))
-}
-
-/// Writes the state to `<path>.tmp` and renames it into place, so a crash
-/// mid-write never leaves a truncated file. Errors name the path.
-fn save_state(path: &Path, det: &Detector, event_clock: bool) -> io::Result<()> {
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    let write = || -> io::Result<()> {
-        let mut w = io::BufWriter::new(std::fs::File::create(&tmp)?);
-        serde_json::to_writer(
-            &mut w,
-            &serde_json::json!({
-                "format": STATE_FORMAT,
-                "tokenizer": det.config().tokenizer.name(),
-                "clock": if event_clock { "event" } else { "wall" },
-                "store": det.store(),
-            }),
-        )?;
-        w.into_inner()?.sync_all()?;
-        std::fs::rename(&tmp, path)
-    };
-    write().map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))
-}
-
 fn print(out: &mut impl Write, format: Format, a: &Anomaly) -> io::Result<()> {
     let kind = a.kind.as_str();
     match format {
@@ -260,15 +307,20 @@ fn print(out: &mut impl Write, format: Format, a: &Anomaly) -> io::Result<()> {
             let msg = format!("{kind:<18} [{}] {}", a.system, a.signature);
             writeln!(out, "{}", msg.trim_end())
         }
+        Format::Text { .. } if a.kind == AnomalyKind::ParameterChange => {
+            let slots = a.changed_params.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
+            writeln!(out, "{kind:<18} [changed_params: {slots}] {}", a.line)
+        }
         Format::Text { .. } => writeln!(out, "{kind:<18} {}", a.line),
         Format::Json => writeln!(
             out,
-            "{{\"system\":{},\"kind\":\"{kind}\",\"score\":{:.2},\"hash\":{},\"signature\":{},\"line\":{}}}",
+            "{{\"system\":{},\"kind\":\"{kind}\",\"score\":{:.2},\"hash\":{},\"signature\":{},\"line\":{},\"changed_params\":{:?}}}",
             json_str(&a.system),
             a.score,
             a.hash.map_or("null".to_string(), |h| format!("\"{h}\"")),
             json_str(&a.signature),
             json_str(&a.line),
+            a.changed_params,
         ),
         Format::Summary => Ok(()),
     }

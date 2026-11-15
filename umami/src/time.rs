@@ -28,6 +28,23 @@ pub fn event_time(tokens: &[Token], now: i64) -> Option<i64> {
     parse_timestamp(&t.text, now)
 }
 
+/// Parses a header timestamp using a previous event as the year anchor.
+///
+/// Unlike [`event_time`]'s historical bootstrap, continuing yearless input may
+/// advance by more than a day.  A backward jump of more than 183 days means
+/// New Year rollover; smaller backward jumps remain late events.  Callers must
+/// reject real-future results before updating their per-system anchor.
+pub fn continuing_event_time(tokens: &[Token], previous: i64) -> Option<i64> {
+    let t = tokens
+        .iter()
+        .filter(|t| t.ty != TokenType::Delimiter)
+        .take(HEADER_TOKENS)
+        .find(|t| t.ty == TokenType::Timestamp)?;
+    parse_iso(&t.text)
+        .or_else(|| parse_clf(&t.text))
+        .or_else(|| parse_syslog_context(&t.text, previous, true))
+}
+
 /// How many leading non-delimiter tokens [`event_time`] searches.
 pub const HEADER_TOKENS: usize = 4;
 
@@ -188,6 +205,10 @@ fn parse_clf(s: &str) -> Option<i64> {
 }
 
 fn parse_syslog(s: &str, now: i64) -> Option<i64> {
+    parse_syslog_context(s, now, false)
+}
+
+fn parse_syslog_context(s: &str, now: i64, continuing: bool) -> Option<i64> {
     let s = match s.get(3..4) {
         Some(" ") if s.as_bytes()[0].is_ascii_alphabetic() && month(s, 0).is_none() => &s[4..],
         _ => s,
@@ -206,6 +227,14 @@ fn parse_syslog(s: &str, now: i64) -> Option<i64> {
     }
     let now = now.clamp(*NOW_RANGE.start(), *NOW_RANGE.end());
     let year = year_of(now);
+    if continuing {
+        let candidate = unix(year, mon, day, secs)?;
+        return if candidate < now - 183 * 86_400 {
+            unix(year + 1, mon, day, secs)
+        } else {
+            Some(candidate)
+        };
+    }
     (year - 1..=year + 1)
         .filter_map(|y| unix(y, mon, day, secs))
         .filter(|&t| t <= now + 86_400)
@@ -340,5 +369,25 @@ mod tests {
             let has_ts = toks.iter().any(|t| t.ty == TokenType::Timestamp);
             assert_eq!(has_ts, event_time(&toks, now).is_some(), "{tok:?} {line}");
         }
+    }
+}
+
+#[cfg(test)]
+mod continuing_tests {
+    use super::*;
+    use crate::tokenizer::Tokenizer;
+
+    #[test]
+    fn continuing_year_keeps_small_late_events_and_rolls_over_large_backward_jumps() {
+        let at =
+            |line, previous| continuing_event_time(&Tokenizer::Structure.tokenize(line), previous);
+        let march = 1_583_366_400;
+        assert_eq!(at("Mar  1 00:00:00 tick", march), Some(1_583_020_800));
+        assert_eq!(at("Apr  2 00:00:00 tick", march), Some(1_585_785_600));
+        assert_eq!(
+            at("Jan  2 00:00:00 tick", 1_609_459_199),
+            Some(1_609_545_600)
+        );
+        assert_eq!(at("2020-01-01 00:00:00 tick", march), Some(1_577_836_800));
     }
 }
