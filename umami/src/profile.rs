@@ -222,6 +222,35 @@ impl Profile {
         }
     }
 
+    fn validate(&self, upper: i64) -> Result<(), String> {
+        validate_time(self.first_seen, upper, "first_seen")?;
+        validate_time(self.last_seen, upper, "last_seen")?;
+        if self.first_seen > self.last_seen {
+            return Err("first_seen exceeds last_seen".into());
+        }
+        for (field, time) in [
+            ("last_stop", self.last_stop),
+            ("last_spike", self.last_spike),
+        ] {
+            if let Some(time) = time {
+                validate_time(time, upper, field)?;
+                if time < self.first_seen {
+                    return Err(format!("{field} precedes first_seen"));
+                }
+            }
+        }
+        if let Some(minute) = self.rate.minute {
+            if !(-62_167_219_200i64.div_euclid(60)..=upper.div_euclid(60)).contains(&minute)
+                || minute != self.last_seen.div_euclid(60)
+            {
+                return Err("rate.minute outside last_seen minute".into());
+            }
+        }
+        validate_stats(&self.interval_stats, "interval_stats")?;
+        validate_stats(&self.rate.stats, "rate.stats")?;
+        Ok(())
+    }
+
     /// Whether the structure arrives at a steady rate: at least twenty intervals,
     /// with a standard deviation at most one fifth of their mean.  Only periodic
     /// profiles are reported as [stopped](crate::AnomalyKind::EventStop).
@@ -321,6 +350,51 @@ impl ProfileStore {
         Self::default()
     }
 
+    /// Validates a restored store before a detector can mutate it.
+    ///
+    /// `now` supplies the wall clock in Unix seconds.  Persisted timestamps must
+    /// fit years 0 through 9999 and cannot exceed `now` by more than one day.
+    /// Errors identify the system, profile, and inconsistent field.
+    pub fn validate(&self, now: i64) -> Result<(), String> {
+        let upper = now.saturating_add(86_400).min(253_402_300_799);
+        let mut hashes = HashSet::new();
+        for (system, profiles) in &self.systems {
+            for (hash, profile) in profiles {
+                let context = format!("system {system:?}, profile {hash}");
+                if *hash != profile.hash {
+                    return Err(format!("{context}: hash disagrees with map key"));
+                }
+                profile
+                    .validate(upper)
+                    .map_err(|e| format!("{context}: {e}"))?;
+                hashes.insert(*hash);
+            }
+            if let Some(clock) = self.clocks.get(system) {
+                validate_time(clock.latest, upper, "clock.latest")
+                    .map_err(|e| format!("system {system:?}: {e}"))?;
+                if clock.lag < 0 || clock.lag > upper.saturating_sub(clock.latest) {
+                    return Err(format!("system {system:?}: clock.lag outside valid range"));
+                }
+                if profiles.values().any(|p| p.last_seen > clock.latest) {
+                    return Err(format!(
+                        "system {system:?}: clock.latest precedes profile.last_seen"
+                    ));
+                }
+            }
+        }
+        if hashes != self.global_hashes {
+            return Err("global_hashes disagree with profile keys".into());
+        }
+        if self
+            .clocks
+            .keys()
+            .any(|system| !self.systems.contains_key(system))
+        {
+            return Err("clock refers to an unknown system".into());
+        }
+        Ok(())
+    }
+
     /// Number of distinct systems known to the store.
     pub fn system_count(&self) -> usize {
         self.systems.len()
@@ -386,6 +460,27 @@ impl ProfileStore {
     }
 }
 
+/// Restricts restored times to the parser's supported civil-date range.
+fn validate_time(time: i64, upper: i64, field: &str) -> Result<(), String> {
+    if !(-62_167_219_200..=upper).contains(&time) {
+        return Err(format!(
+            "{field} outside supported timestamp range or in the future"
+        ));
+    }
+    Ok(())
+}
+
+/// Rejects invalid accumulators before they can produce NaNs or false alerts.
+fn validate_stats(stats: &RunningStats, field: &str) -> Result<(), String> {
+    if !stats.mean.is_finite() || !stats.m2.is_finite() || stats.mean < 0.0 || stats.m2 < 0.0 {
+        return Err(format!("{field} requires finite nonnegative mean and m2"));
+    }
+    if stats.count == 0 && (stats.mean != 0.0 || stats.m2 != 0.0) {
+        return Err(format!("{field} has moments without samples"));
+    }
+    Ok(())
+}
+
 /// Extracts the `(slot, value)` pairs of dynamic parameter tokens from a
 /// tokenized line, where `slot` is the parameter's ordinal (0 for the first
 /// parameter). Lines sharing a [`StructureHash`] have the same slots, so a
@@ -407,6 +502,26 @@ mod tests {
     use crate::signature::structure_signature;
     use crate::token::TokenType;
     use crate::tokenize;
+
+    #[test]
+    fn restored_store_rejects_nonfinite_statistics() {
+        let mut store = ProfileStore::new();
+        let tokens = tokenize("hello");
+        let hash = structure_signature(&tokens);
+        store.get_or_insert("host", hash, &tokens, 0);
+        assert!(store.validate(0).is_ok());
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            store
+                .systems
+                .get_mut("host")
+                .unwrap()
+                .get_mut(&hash)
+                .unwrap()
+                .interval_stats
+                .mean = value;
+            assert!(store.validate(0).unwrap_err().contains("interval_stats"));
+        }
+    }
 
     #[test]
     fn running_stats_zscore() {

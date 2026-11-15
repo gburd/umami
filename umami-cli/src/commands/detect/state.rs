@@ -61,6 +61,17 @@ impl State {
         if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
             return Err(format!("{}: state must not be a symlink", path.display()).into());
         }
+        #[cfg(unix)]
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.nlink() > 1 {
+                return Err(format!(
+                    "{}: state must not have multiple hard links",
+                    path.display()
+                )
+                .into());
+            }
+        }
         let mut lock_path = path.as_os_str().to_owned();
         lock_path.push(".lock");
         let lock = OpenOptions::new()
@@ -107,6 +118,10 @@ impl State {
         {
             return Err(fail("state contains a future timestamp").into());
         }
+        envelope
+            .store
+            .validate(super::wall_clock())
+            .map_err(|e| fail(&format!("invalid learned state: {e}")))?;
         Ok((envelope.store, envelope.anchors))
     }
 

@@ -138,6 +138,7 @@ pub fn run(args: Args, format: Format) -> Result<(), Box<dyn Error>> {
     let output = output::Output::stdout();
     let result = (|| -> Result<(), Box<dyn Error>> {
         loop {
+            output.check()?;
             if session.tick()? {
                 break;
             }
@@ -155,9 +156,11 @@ pub fn run(args: Args, format: Format) -> Result<(), Box<dyn Error>> {
         }
         Ok(())
     })();
-    session.save()?;
+    let saved = session.save();
+    let drained = output.finish(|| session.tick());
+    saved?;
     result?;
-    output.finish(|| session.tick())?;
+    drained?;
     Ok(())
 }
 

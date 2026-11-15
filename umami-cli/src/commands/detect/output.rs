@@ -34,6 +34,15 @@ impl Output {
         }
     }
 
+    /// Reports asynchronous write failures even when no further output is produced.
+    pub fn check(&self) -> io::Result<()> {
+        match self.finished.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => Ok(()),
+            Err(mpsc::TryRecvError::Disconnected) => Err(io::Error::other("output worker stopped")),
+        }
+    }
+
     /// Waits for queue space without suppressing shutdown or checkpoint deadlines.
     pub fn send(
         &self,
@@ -41,11 +50,12 @@ impl Output {
         mut tick: impl FnMut() -> io::Result<bool>,
     ) -> io::Result<()> {
         if bytes.is_empty() {
-            return Ok(());
+            return self.check();
         }
         loop {
+            self.check()?;
             if tick()? {
-                return Ok(());
+                return self.check();
             }
             match self.sender.try_send(bytes) {
                 Ok(()) => return Ok(()),
@@ -63,12 +73,21 @@ impl Output {
 
     /// Drains on normal EOF; shutdown can discard queued output after state is saved.
     pub fn finish(self, mut tick: impl FnMut() -> io::Result<bool>) -> io::Result<()> {
-        drop(self.sender);
+        let Self {
+            sender, finished, ..
+        } = self;
+        drop(sender);
         loop {
             if tick()? {
-                return Ok(());
+                return match finished.try_recv() {
+                    Ok(result) => result,
+                    Err(mpsc::TryRecvError::Empty) => Ok(()),
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        Err(io::Error::other("output worker stopped"))
+                    }
+                };
             }
-            match self.finished.recv_timeout(super::input::WAKE) {
+            match finished.recv_timeout(super::input::WAKE) {
                 Ok(result) => return result,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {

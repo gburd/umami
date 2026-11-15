@@ -882,3 +882,150 @@ fn duplicate_and_missing_state_fields_are_rejected() {
         assert_eq!(std::fs::read_to_string(&state).unwrap(), bad);
     }
 }
+
+#[test]
+fn leap_day_rollover_uses_next_year_before_date_validation() {
+    let state = scratch("leap-rollover").join("s.json");
+    umami()
+        .args(["sim", "--state", state.to_str().unwrap()])
+        .write_stdin("2023-12-31 00:00:00 tick\nFeb 29 00:00:00 tick\n")
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(state).unwrap()).unwrap();
+    assert_eq!(v["anchors"]["stdin"], 1_709_164_800i64);
+}
+
+#[test]
+fn corrupt_nested_state_is_rejected_without_overwrite() {
+    let state = scratch("nested-state").join("s.json");
+    umami()
+        .args(["sim", "--state", state.to_str().unwrap()])
+        .write_stdin("2020-01-01 00:00:00 tick\n")
+        .assert()
+        .success();
+    let good: serde_json::Value = serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+    let hash = good["store"]["systems"]["stdin"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap();
+    for (field, value) in [
+        ("last_seen", serde_json::json!(4_070_908_800i64)),
+        ("first_seen", serde_json::json!(i64::MIN)),
+        ("first_seen", serde_json::json!(1_577_836_801i64)),
+        ("last_spike", serde_json::json!(4_070_908_800i64)),
+        ("last_stop", serde_json::json!(0)),
+        ("rate/minute", serde_json::json!(i64::MIN)),
+        ("rate/minute", serde_json::json!(67_848_480i64)),
+        ("interval_stats/mean", serde_json::json!(-1)),
+        ("rate/stats/m2", serde_json::json!(-1)),
+        ("hash", serde_json::json!(0)),
+    ] {
+        let mut bad = good.clone();
+        *bad.pointer_mut(&format!("/store/systems/stdin/{hash}/{field}"))
+            .unwrap() = value;
+        assert_state_rejected(&state, &bad);
+    }
+    let mut bad = good.clone();
+    bad["store"]["clocks"]["stdin"]["lag"] = serde_json::json!(i64::MIN);
+    assert_state_rejected(&state, &bad);
+}
+
+fn assert_state_rejected(state: &std::path::Path, bad: &serde_json::Value) {
+    let bytes = serde_json::to_vec(bad).unwrap();
+    std::fs::write(state, &bytes).unwrap();
+    umami()
+        .args(["sim", "--state", state.to_str().unwrap()])
+        .write_stdin("2020-01-01 00:01:00 tick\n")
+        .assert()
+        .failure();
+    assert_eq!(std::fs::read(state).unwrap(), bytes);
+}
+
+#[cfg(unix)]
+#[test]
+fn hardlinked_state_is_refused() {
+    let dir = scratch("hardlink");
+    let state = dir.join("s.json");
+    umami()
+        .args(["sim", "--state", state.to_str().unwrap()])
+        .write_stdin("hello\n")
+        .assert()
+        .success();
+    let alias = dir.join("alias.json");
+    std::fs::hard_link(&state, &alias).unwrap();
+    let before = std::fs::read(&state).unwrap();
+    for path in [&state, &alias] {
+        umami()
+            .args(["sim", "--state", path.to_str().unwrap()])
+            .write_stdin("hello\n")
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("hard link"));
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn output_failure_is_reported_while_input_is_idle() {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("umami"))
+        .arg("pipeline")
+        .stdin(Stdio::piped())
+        .stdout(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap(),
+        )
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(child.stdin.as_mut().unwrap(), "accepted marker").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    if child.try_wait().unwrap().is_none() {
+        signal(&child, "-TERM");
+    }
+    let status = wait_for_exit(&mut child);
+    let mut error = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut error)
+        .unwrap();
+    assert!(!status.success(), "{error}");
+    assert!(error.contains("space"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn parse_error_drains_preceding_accepted_output() {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("umami"))
+        .arg("pipeline")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let accepted = format!("2020-01-01 00:00:00 {}", "x".repeat(100_000));
+    let input = format!("{accepted}\n2099-01-01 00:00:00 rejected\n");
+    let mut stdin = child.stdin.take().unwrap();
+    let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()).unwrap());
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let mut output = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    writer.join().unwrap();
+    assert!(!wait_for_exit(&mut child).success());
+    assert_eq!(output, format!("never_before_seen  {accepted}\n"));
+}

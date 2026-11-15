@@ -228,11 +228,11 @@ fn parse_syslog_context(s: &str, now: i64, continuing: bool) -> Option<i64> {
     let now = now.clamp(*NOW_RANGE.start(), *NOW_RANGE.end());
     let year = year_of(now);
     if continuing {
-        let candidate = unix(year, mon, day, secs)?;
+        let candidate = days_from_civil(year, mon, day) * 86_400 + secs;
         return if candidate < now - 183 * 86_400 {
             unix(year + 1, mon, day, secs)
         } else {
-            Some(candidate)
+            unix(year, mon, day, secs)
         };
     }
     (year - 1..=year + 1)
