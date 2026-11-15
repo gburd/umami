@@ -4,12 +4,16 @@
 structure of streaming log events and surfaces only the *new, changed and
 anomalous* lines, filtering out the bulk of repetitive, already-seen logs.
 
-The registry package uses the name umami-log; Rust code imports umami.
+The package uses the name umami-log; Rust code imports umami.  For an application
+beside a checkout of this repository, use a local path:
 
 ```toml
 [dependencies]
-umami = { package = "umami-log", version = "0.2" }
+umami = { package = "umami-log", path = "../umami/umami" }
 ```
+
+Registry installation requires separate publication of umami-log.  The crates.io
+package named umami belongs to an unrelated project.
 
 ## How it works
 

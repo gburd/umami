@@ -3,8 +3,12 @@
 Umami reads logs from stdin and reports novel structures, rate changes, missing periodic
 messages, and changes in stable parameters.  The executable name is `umami`.
 
+Build from the workspace checkout without requiring registry publication:
+
 ```sh
-cargo install umami-cli
+export CARGO_TARGET_DIR=/scratch/umami/build
+cargo build --release --locked -p umami-cli
+export PATH="$CARGO_TARGET_DIR/release:$PATH"
 umami pipeline --state learned.json < application.log
 umami ingest --parameters < application.log
 umami sim < application.log
