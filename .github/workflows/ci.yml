@@ -37,6 +37,8 @@ jobs:
         run: |
           shellcheck scripts/*.sh
           scripts/test-release.sh
+          rustup toolchain install 1.88.0 --profile minimal --target x86_64-unknown-linux-musl
+          scripts/test-release-validation.sh
 
   msrv:
     runs-on: ubuntu-24.04

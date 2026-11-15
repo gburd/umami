@@ -20,6 +20,7 @@ toolchain=1.88.0
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/scratch/umami/target-ci}
 export RUSTDOCFLAGS='-D warnings'
 scratch=${TMPDIR:-/scratch/umami}
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 # Refuse existing output rather than replacing a previous release's evidence.
 source_archive() {
@@ -39,19 +40,6 @@ extract_source() {
   printf 'Extracted release work: %s\n' "$work"
 }
 
-# Reject dynamically linked binaries and exercise the installed command's parser.
-check_binary() {
-  local binary=$1
-  if readelf -l "$binary" | grep INTERP >/dev/null ||
-    readelf -d "$binary" | grep NEEDED >/dev/null; then
-    echo "Release binary is not static: $binary" >&2
-    exit 1
-  fi
-  "$binary" --version
-  printf 'service started\n' | "$binary" tokenize >"$work/tokenized"
-  test -s "$work/tokenized"
-}
-
 # Build and test before packing the standalone binary and generated API documentation.
 build_artifacts() {
   export SOURCE_DATE_EPOCH
@@ -69,7 +57,10 @@ build_artifacts() {
   mkdir "$work/$name-$target" "$work/$name-docs"
   cp "$CARGO_TARGET_DIR/$target/release/umami" "$work/$name-$target/"
   cp "$source_dir"/LICENSE-* "$work/$name-$target/"
-  check_binary "$work/$name-$target/umami"
+  package_id=$(cd "$source_dir" && cargo +"$toolchain" pkgid -p umami-cli)
+  version=${package_id##*#}
+  version=${version##*@}
+  "$script_dir/check-release-binary.sh" "$work/$name-$target/umami" "$version"
   cp -R "$docs_target/doc" "$work/$name-docs/api"
   cp -R "$source_dir/man" "$work/$name-docs/man"
   cp "$source_dir"/LICENSE-* "$work/$name-docs/"
@@ -93,7 +84,10 @@ check_artifacts() {
   )
   "$work/install/bin/umami" --version
   tar -xzf "$out/$name-$target.tar.gz" -C "$work"
-  check_binary "$work/$name-$target/umami"
+  package_id=$(cd "$source_dir" && cargo +"$toolchain" pkgid -p umami-cli)
+  version=${package_id##*#}
+  version=${version##*@}
+  "$script_dir/check-release-binary.sh" "$work/$name-$target/umami" "$version"
   tar -xzf "$out/$name-docs.tar.gz" -C "$work"
   test -s "$work/$name-docs/api/umami/index.html"
   test -s "$work/$name-docs/man/umami.1"

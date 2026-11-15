@@ -43,6 +43,7 @@ export CARGO_TARGET_DIR=/scratch/umami/target-ci
 export TMPDIR=/scratch/umami/tmp
 mkdir -p "$TMPDIR"
 scripts/test-release.sh
+scripts/test-release-validation.sh
 scripts/release.sh build vVERSION /scratch/umami/dist-VERSION
 scripts/release.sh check vVERSION /scratch/umami/dist-VERSION
 ```
@@ -56,8 +57,9 @@ need access to the dependencies in Cargo.lock, either cached locally or availabl
 from crates.io.  The archive does not vendor third-party dependencies.
 
 The check command validates checksums, reruns extracted workspace tests, installs
-the CLI using its workspace path dependency, checks that the packaged ELF has no
-interpreter or dynamic dependencies, runs the binary, and checks the generated
+the CLI using its workspace path dependency, requires successful ELF inspection,
+checks for x86_64 and absence of an interpreter or dynamic dependencies, verifies
+the exact source-package version and tokenization output, and checks the generated
 docs.  Fresh scratch directories retain evidence and avoid overwriting earlier
 runs.  Remove those task-owned directories with trash when finished.
 
@@ -74,6 +76,11 @@ For source-only checks, release.sh source REF OUTPUT builds the canonical source
 archive and SHA256SUMS without invoking Rust.  REF may also name a commit hash.
 The self-check creates a temporary Git repository and exercises committed-only
 contents, deterministic bytes, corruption detection, and refusal to overwrite.
+
+The validation self-check uses a compiled static fixture, rejects non-ELF and
+dynamic executables, truncated headers, incorrect versions, and incorrect smoke
+output, and checks lightweight and annotated tags against a local Git remote.
+It requires a C compiler and the pinned Rust toolchain with its musl target.
 
 ## Minimum supported Rust versions
 
@@ -98,7 +105,11 @@ actionlint
 ```
 
 The tag workflow runs CI before building, checks the artifacts before uploading,
-and publishes only the successful build's outputs.  A pre-existing GitHub release
+and publishes only the successful build's outputs.  Immediately before publication,
+it resolves the remote tag, peeling annotated tags, and requires the result to equal
+the workflow's triggering commit.  Tags must still remain immutable: GitHub offers
+no atomic compare-and-create-release operation to close the interval between that
+check and publication.  A pre-existing GitHub release
 causes publication to fail rather than replacing its assets.  Remote publication
 and download verification still require a real authorized tag push; local checks
 do not prove those operations succeeded.
