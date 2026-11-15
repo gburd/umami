@@ -32,6 +32,11 @@ jobs:
       - run: cargo +stable fmt --all --check
       - run: cargo +stable clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo +stable test --workspace --all-features --locked
+      - name: Check live checkpoint deadlines
+        run: >-
+          cargo +stable test -p umami-cli --test cli
+          checkpoint_deadline_runs_with_idle_busy_and_blocked_streams
+          -- --ignored --exact
       - run: cargo +stable doc --workspace --all-features --no-deps --locked
       - name: Check release tooling
         run: |
